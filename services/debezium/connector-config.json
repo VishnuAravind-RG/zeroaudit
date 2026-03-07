@@ -1,0 +1,26 @@
+{
+    "name": "zeroaudit-postgres-connector",
+    "config": {
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "database.hostname": "postgres",
+        "database.port": "5432",
+        "database.user": "audit_user",
+        "database.password": "StrongPass123!",
+        "database.dbname": "zeroaudit",
+        "database.server.name": "zeroaudit",
+        "table.include.list": "public.transactions",
+        "plugin.name": "pgoutput",
+        "slot.name": "zeroaudit_slot",
+        "publication.name": "zeroaudit_pub",
+        "publication.autocreate.mode": "filtered",
+        "topic.prefix": "zeroaudit",
+        "transforms": "unwrap",
+        "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+        "transforms.unwrap.drop.tombstones": "false",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter.schemas.enable": "false",
+        "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "key.converter.schemas.enable": "false",
+        "snapshot.mode": "initial"
+    }
+}
