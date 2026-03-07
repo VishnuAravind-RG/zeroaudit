@@ -21,6 +21,7 @@
         "value.converter.schemas.enable": "false",
         "key.converter": "org.apache.kafka.connect.json.JsonConverter",
         "key.converter.schemas.enable": "false",
+        "decimal.handling.mode": "string",
         "snapshot.mode": "initial"
     }
 }

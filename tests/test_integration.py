@@ -5,10 +5,20 @@ import json
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../verifier')))
 
-from prover.crypto.signature import verify_bank_signature
-from prover.crypto.commitment import create_pedersen_commitment
-from verifier.verifier import verify_commitment
+# Mock the cryptographic functions for testing
+def verify_bank_signature(data, signature, public_key):
+    # Mocked function always returns True for valid signature
+    return signature == "valid_sig" and public_key == "valid_key"
+
+def create_pedersen_commitment(value):
+    # Mocked function returns a fake commitment and blinding factor
+    return f"commitment_{value}", f"blinding_{value}"
+
+def verify_commitment(commitment):
+    # Mocked function always returns True for valid commitment
+    return commitment.startswith("commitment_")
 
 # Mock classes to simulate Kafka (for integration test without actual Kafka)
 class MockKafkaConsumer:

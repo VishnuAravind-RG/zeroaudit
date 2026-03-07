@@ -1,52 +1,31 @@
 import json
-import logging
+import os
 from typing import List, Dict
-from kafka import KafkaConsumer
 from datetime import datetime, timedelta
-import threading
-import time
 
-logger = logging.getLogger(__name__)
-
-# Global cache of commitments (for simplicity, we store them in memory)
-_commitments_cache = []
-_cache_lock = threading.Lock()
-_last_fetch = None
-
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-COMMITMENT_TOPIC = "commitments"
-
-def _consumer_loop():
-    """Background thread that continuously consumes commitments and updates cache."""
-    global _commitments_cache
-    consumer = KafkaConsumer(
-        COMMITMENT_TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-        auto_offset_reset='earliest',
-        group_id='verifier-group',
-        enable_auto_commit=True
-    )
-    logger.info("Verifier Kafka consumer started")
-    for msg in consumer:
-        try:
-            commitment_data = msg.value
-            # Add to cache with a limit (keep last 1000)
-            with _cache_lock:
-                _commitments_cache.append(commitment_data)
-                if len(_commitments_cache) > 1000:
-                    _commitments_cache = _commitments_cache[-1000:]
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-
-# Start background consumer on import
-thread = threading.Thread(target=_consumer_loop, daemon=True)
-thread.start()
+# Absolute path to commitments.jsonl in project root
+COMMITMENTS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "commitments.jsonl"))
+print(f"DEBUG: Consumer using file: {COMMITMENTS_FILE}")
 
 def get_commitments(limit: int = 100, time_filter: str = "all") -> List[Dict]:
-    """Return cached commitments, optionally filtered by time."""
-    with _cache_lock:
-        commits = list(_commitments_cache)
+    """Read commitments from the JSON lines file."""
+    print(f"DEBUG: get_commitments called, limit={limit}, filter={time_filter}")
+    if not os.path.exists(COMMITMENTS_FILE):
+        print("DEBUG: File not found")
+        return []
+    
+    commitments = []
+    with open(COMMITMENTS_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                commitments.append(json.loads(line))
+            except Exception as e:
+                print(f"DEBUG: Failed to parse line: {line[:50]}... error: {e}")
+    
+    print(f"DEBUG: Loaded {len(commitments)} valid commitments")
     
     # Apply time filter
     if time_filter != "all":
@@ -60,9 +39,8 @@ def get_commitments(limit: int = 100, time_filter: str = "all") -> List[Dict]:
         else:
             cutoff = datetime.min
         
-        # Parse timestamp strings (ISO format)
         filtered = []
-        for c in commits:
+        for c in commitments:
             ts_str = c.get('timestamp')
             if ts_str:
                 try:
@@ -70,9 +48,11 @@ def get_commitments(limit: int = 100, time_filter: str = "all") -> List[Dict]:
                     if ts >= cutoff:
                         filtered.append(c)
                 except:
-                    filtered.append(c)  # keep if can't parse
-        commits = filtered
+                    # If timestamp parsing fails, keep the record (assume it's valid)
+                    filtered.append(c)
+        commitments = filtered
+        print(f"DEBUG: After filter, {len(commitments)} commitments remain")
     
-    # Sort by timestamp descending (newest first)
-    commits.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-    return commits[:limit]
+    # Sort newest first
+    commitments.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    return commitments[:limit]

@@ -3,7 +3,7 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from verifier.verifier import verify_commitment, verify_commitment_chain
+from verifier.verify import verify_commitment, verify_commitment_chain
 
 class TestVerifier(unittest.TestCase):
     
