@@ -1,28 +1,39 @@
 #!/bin/bash
+# ZEROAUDIT Kafka Topic Initialization
+set -e
 
-# =====================================================
-# Create Kafka topics for ZEROAUDIT
-# Run this after Kafka is up and healthy.
-# =====================================================
+KAFKA_BROKER="kafka:29092"
+REPLICATION=1
+PARTITIONS=6
 
 echo "Waiting for Kafka to be ready..."
-cub kafka-ready -b kafka:9092 1 20   # part of the Kafka image, waits for broker
+sleep 10
 
-# Topics
-# - raw-transactions: Debezium will publish here (actual name may vary based on connector config)
-# - commitments: our prover will publish commitments here
+create_topic() {
+  local TOPIC=$1
+  local RETENTION_MS=$2
+  echo "Creating topic: $TOPIC"
+  kafka-topics --bootstrap-server $KAFKA_BROKER \
+    --create --if-not-exists \
+    --topic $TOPIC \
+    --partitions $PARTITIONS \
+    --replication-factor $REPLICATION \
+    --config retention.ms=$RETENTION_MS \
+    --config cleanup.policy=delete \
+    --config compression.type=lz4
+}
 
-# Debezium, when configured with topic.prefix="zeroaudit", will publish to:
-#   zeroaudit.public.transactions
-# So we don't need to create it manually; Kafka auto-creates topics with default settings.
-# But we'll create the commitments topic explicitly.
+# Raw transactions from Cassandra CDC
+create_topic "zeroaudit.transactions.raw"       604800000   # 7 days
 
-echo "Creating 'commitments' topic..."
-kafka-topics --bootstrap-server kafka:9092 \
-             --create \
-             --if-not-exists \
-             --topic commitments \
-             --partitions 3 \
-             --replication-factor 1
+# LWE-committed, signed records
+create_topic "zeroaudit.transactions.committed" 2592000000  # 30 days
 
-echo "Topics created successfully!"
+# Anomaly flags (quarantined transactions)
+create_topic "zeroaudit.anomalies"              2592000000  # 30 days
+
+# Dead letter queue
+create_topic "zeroaudit.dlq"                    604800000   # 7 days
+
+echo "All Kafka topics created successfully."
+kafka-topics --bootstrap-server $KAFKA_BROKER --list

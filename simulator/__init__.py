@@ -1,1 +1,0 @@
-# Makes the simulator directory a Python package

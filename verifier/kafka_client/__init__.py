@@ -1,1 +1,0 @@
-from .consumer import get_commitments

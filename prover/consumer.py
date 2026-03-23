@@ -1,89 +1,166 @@
+"""
+consumer.py — Kafka Consumer for ZEROAUDIT Prover
+Reads raw transactions from Kafka, runs them through:
+  1. Anomaly detection (score injection)
+  2. LWE commitment generation
+  3. Ed25519 signing
+  4. Cassandra write + Kafka publish to committed topic
+"""
+
 import json
+import time
 import logging
-from datetime import datetime
-from kafka import KafkaConsumer, KafkaProducer
-from prover.config import settings
-from prover.crypto.signature import verify_bank_signature
-from prover.crypto.commitment import create_pedersen_commitment
+import uuid
+from typing import Optional
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from .config.settings import settings
+from .crypto.commitment import get_store
+from .crypto.signature import get_signing_key, sign_commitment
+from .models.transaction import RawTransaction, AnomalyFlag
 
-def start_consumer():
-    """Main loop: consume raw transactions (after Debezium transform), verify, produce commitments."""
-    consumer = KafkaConsumer(
-        settings.RAW_TOPIC,
-        bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-        auto_offset_reset='earliest',
-        group_id=settings.CONSUMER_GROUP,
-        enable_auto_commit=True
-    )
+logger = logging.getLogger("zeroaudit.consumer")
 
-    producer = KafkaProducer(
-        bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v, default=str).encode('utf-8')
-    )
+try:
+    from kafka import KafkaConsumer, KafkaProducer
+    _KAFKA_AVAILABLE = True
+except ImportError:
+    _KAFKA_AVAILABLE = False
+    logger.warning("kafka-python not installed — consumer will run in stub mode")
 
-    logger.info(f"Listening to topic: {settings.RAW_TOPIC}")
 
-    for message in consumer:
+class ProverConsumer:
+    """
+    Kafka consumer that drives the full prover pipeline:
+    RAW TXN → ANOMALY SCORE → LWE COMMIT → SIGN → PUBLISH
+    """
+
+    def __init__(self, cassandra_session=None):
+        self._store = get_store(cassandra_session)
+        self._signing_key = get_signing_key()
+        self._consumer: Optional[object] = None
+        self._producer: Optional[object] = None
+        self._running = False
+        self._stats = {
+            "processed": 0,
+            "committed": 0,
+            "quarantined": 0,
+            "errors": 0,
+            "start_time": time.time(),
+        }
+
+    def _connect(self):
+        if not _KAFKA_AVAILABLE:
+            logger.warning("Kafka not available — skipping connect")
+            return
+
+        self._consumer = KafkaConsumer(
+            settings.KAFKA_TOPIC_INGEST,
+            bootstrap_servers=settings.KAFKA_BOOTSTRAP,
+            group_id=settings.KAFKA_CONSUMER_GROUP,
+            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            max_poll_records=settings.KAFKA_MAX_POLL_RECORDS,
+            enable_auto_commit=False,
+            auto_offset_reset="earliest",
+        )
+        self._producer = KafkaProducer(
+            bootstrap_servers=settings.KAFKA_BOOTSTRAP,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            acks="all",
+            retries=3,
+        )
+        logger.info(f"Connected to Kafka @ {settings.KAFKA_BOOTSTRAP}")
+
+    def _process_message(self, raw_msg: dict):
+        """Full pipeline for a single transaction message."""
         try:
-            # After ExtractNewRecordState transform, the message is directly the 'after' data.
-            # It may contain fields like id, transaction_id, account_id, amount, balance, etc.
-            record = message.value
+            # 1. Parse raw transaction
+            raw_txn = RawTransaction.from_kafka_msg(raw_msg)
 
-            # Basic validation: must have transaction_id
-            tx_id = record.get('transaction_id')
-            if not tx_id:
-                logger.debug("Skipping message without transaction_id")
-                continue
+            # 2. Get anomaly score (injected from Kafka msg or default 0)
+            anomaly_score = float(raw_msg.get("anomaly_score", 0.0))
 
-            # Extract fields
-            account_id = record.get('account_id')
-            amount = float(record.get('amount', 0))
-            balance = float(record.get('balance', 0))
-            signature = record.get('bank_signature')
-            pub_key = record.get('bank_public_key')
-            timestamp = record.get('timestamp', datetime.now().isoformat())
-            metadata_raw = record.get('metadata')
+            # 3. Generate LWE commitment
+            record = self._store.add(
+                txn_id=raw_txn.txn_id,
+                amount_cents=raw_txn.amount_cents,
+                account_id=raw_txn.account_id,
+                txn_type=raw_txn.txn_type,
+                anomaly_score=anomaly_score,
+            )
 
-            # Parse metadata if it's a JSON string (as seen in the console output)
-            metadata = {}
-            if metadata_raw:
-                if isinstance(metadata_raw, str):
-                    try:
-                        metadata = json.loads(metadata_raw)
-                    except:
-                        metadata = {'raw': metadata_raw}
-                else:
-                    metadata = metadata_raw
+            # 4. Sign the commitment
+            envelope = sign_commitment(
+                signing_key=self._signing_key,
+                txn_id=record.txn_id,
+                binding_hash=record.binding_hash,
+                timestamp_ns=record.timestamp_ns,
+            )
 
-            transaction_type = metadata.get('type') if metadata else None
+            # 5. Build output payload (zero PII)
+            output = {
+                **record.to_export_dict(),
+                "signature": envelope,
+                "pipeline_stage": "SGX_COMMITTED",
+            }
 
-            # Build the signed data (same as bank_sim used)
-            signed_data = f"{tx_id}{amount}{balance}"
+            # 6. Publish to committed topic
+            if self._producer:
+                self._producer.send(settings.KAFKA_TOPIC_COMMITTED, value=output)
 
-            # Verify signature
-            if verify_bank_signature(signed_data, signature, pub_key):
-                logger.info(f"✅ Signature valid for {tx_id}")
+                # Also publish to anomalies topic if quarantined
+                if record.status == "QUARANTINED":
+                    self._producer.send(settings.KAFKA_TOPIC_ANOMALIES, value=output)
 
-                # Create commitment (using balance as the secret value)
-                commitment, blinding = create_pedersen_commitment(balance)
-
-                # Produce commitment to output topic
-                commitment_msg = {
-                    "transaction_id": tx_id,
-                    "account_id": account_id,
-                    "transaction_type": transaction_type,
-                    "commitment": commitment,
-                    "timestamp": timestamp,
-                    "verified": True
-                }
-                producer.send(settings.COMMITMENT_TOPIC, value=commitment_msg)
-                producer.flush()
-                logger.info(f"✅ Commitment published for {tx_id} (account={account_id}, type={transaction_type})")
+            # 7. Update stats
+            self._stats["processed"] += 1
+            if record.status == "QUARANTINED":
+                self._stats["quarantined"] += 1
             else:
-                logger.error(f"❌ Signature invalid for {tx_id}")
+                self._stats["committed"] += 1
+
+            logger.debug(f"Committed {raw_txn.txn_id} [{record.status}]")
+
         except Exception as e:
-            logger.exception(f"Error processing message: {e}")
+            self._stats["errors"] += 1
+            logger.error(f"Pipeline error for {raw_msg.get('txn_id', '?')}: {e}", exc_info=True)
+
+    def run(self):
+        """Start the consumer loop."""
+        self._running = True
+        self._connect()
+
+        if not _KAFKA_AVAILABLE or not self._consumer:
+            logger.info("Running in stub mode — no Kafka messages to consume")
+            return
+
+        logger.info("Prover consumer started. Listening for transactions...")
+        try:
+            for message in self._consumer:
+                if not self._running:
+                    break
+                self._process_message(message.value)
+                self._consumer.commit()
+
+                # Log TPS every 1000 messages
+                if self._stats["processed"] % 1000 == 0:
+                    elapsed = time.time() - self._stats["start_time"]
+                    tps = self._stats["processed"] / max(elapsed, 1)
+                    logger.info(f"TPS={tps:.1f} | committed={self._stats['committed']} | quarantined={self._stats['quarantined']}")
+
+        except KeyboardInterrupt:
+            logger.info("Consumer shutdown requested")
+        finally:
+            self.stop()
+
+    def stop(self):
+        self._running = False
+        if self._consumer:
+            self._consumer.close()
+        if self._producer:
+            self._producer.flush()
+            self._producer.close()
+        logger.info(f"Consumer stopped. Final stats: {self._stats}")
+
+    def tps(self) -> float:
+        elapsed = time.time() - self._stats["start_time"]
+        return round(self._stats["processed"] / max(elapsed, 1), 1)

@@ -1,81 +1,199 @@
-import hashlib
-import logging
-import time
-import json
+"""
+bank_sim.py — ZEROAUDIT Bank Transaction Simulator
+Generates realistic high-frequency banking transactions and publishes to Kafka.
+Injects anomalous transactions at a configurable rate for testing.
+"""
 
-logger = logging.getLogger(__name__)
+import json
+import random
+import time
+import uuid
+import math
+import logging
+import argparse
+from datetime import datetime
+
+logger = logging.getLogger("zeroaudit.simulator")
+
+try:
+    from kafka import KafkaProducer
+    _KAFKA_AVAILABLE = True
+except ImportError:
+    _KAFKA_AVAILABLE = False
+    logger.warning("kafka-python not installed — outputting to stdout")
+
+# ── Transaction Templates ──────────────────────────────────────────────────────
+
+TXN_TYPES = ["RTGS", "NEFT", "WIRE_TRANSFER", "TRADE_SETTLEMENT", "INTERNAL_TRANSFER", "FX_CONVERSION"]
+TXN_TYPE_WEIGHTS = [0.35, 0.30, 0.10, 0.10, 0.10, 0.05]
+
+# Realistic INR amount ranges per type (in paise / cents)
+AMOUNT_RANGES = {
+    "RTGS":               (200_000_00, 50_000_000_00),   # 2L – 50Cr
+    "NEFT":               (1_00,       200_000_00),       # ₹1 – 2L
+    "WIRE_TRANSFER":      (1_000_00,   10_000_000_00),    # 1K – 10Cr
+    "TRADE_SETTLEMENT":   (10_000_00,  100_000_000_00),   # 10K – 100Cr
+    "INTERNAL_TRANSFER":  (1_00,       500_000_00),       # ₹1 – 5L
+    "FX_CONVERSION":      (50_000_00,  1_000_000_000_00), # 50K – 1000Cr
+}
+
+ACCOUNT_POOL = [f"ACC-{random.randint(1000, 9999)}" for _ in range(200)]
+CURRENCIES = ["INR"] * 8 + ["USD", "EUR", "GBP", "JPY", "AED", "SGD"]
+
+
+def _log_normal_amount(low: int, high: int) -> int:
+    """Sample from log-normal to mimic real transaction distributions."""
+    log_low = math.log(max(low, 1))
+    log_high = math.log(high)
+    mu = (log_low + log_high) / 2
+    sigma = (log_high - log_low) / 6
+    val = int(math.exp(random.gauss(mu, sigma)))
+    return max(low, min(high, val))
+
+
+def generate_normal_transaction() -> dict:
+    txn_type = random.choices(TXN_TYPES, weights=TXN_TYPE_WEIGHTS)[0]
+    low, high = AMOUNT_RANGES[txn_type]
+    amount = _log_normal_amount(low, high)
+
+    account = random.choice(ACCOUNT_POOL)
+    counterparty = random.choice([a for a in ACCOUNT_POOL if a != account])
+
+    return {
+        "txn_id": f"TXN-{uuid.uuid4().hex[:16].upper()}",
+        "account_id": account,
+        "counterparty_id": counterparty,
+        "amount_cents": amount,
+        "currency": random.choice(CURRENCIES),
+        "txn_type": txn_type,
+        "timestamp_ns": time.time_ns(),
+        "anomaly_score": round(random.uniform(0.0, 0.3), 4),
+        "metadata": {
+            "channel": random.choice(["mobile", "web", "branch", "api"]),
+            "device_os": random.choice(["iOS", "Android", "macOS", "Windows"]),
+            "city": random.choice(["Mumbai", "Delhi", "Bangalore", "Chennai", "Hyderabad"]),
+        }
+    }
+
+
+def generate_anomalous_transaction(anomaly_type: str = None) -> dict:
+    """Generate a transaction designed to trigger the anomaly detector."""
+    types = ["round_number", "offhours_cayman", "high_velocity", "ofac_adjacent", "benford_violation"]
+    atype = anomaly_type or random.choice(types)
+
+    base = generate_normal_transaction()
+
+    if atype == "round_number":
+        # Structuring: suspiciously round numbers just below reporting thresholds
+        thresholds = [1_000_000_00, 5_000_000_00, 10_000_000_00]
+        base["amount_cents"] = random.choice(thresholds) - 1_00
+        base["anomaly_score"] = round(random.uniform(0.80, 0.95), 4)
+
+    elif atype == "offhours_cayman":
+        # Login from Cayman Islands at 3AM
+        base["anomaly_score"] = round(random.uniform(0.85, 0.98), 4)
+        base["metadata"].update({
+            "city": "Cayman Islands",
+            "device_os": "Windows",
+            "hour": 3,
+        })
+
+    elif atype == "high_velocity":
+        # Flooding transactions from same account
+        base["anomaly_score"] = round(random.uniform(0.78, 0.92), 4)
+        base["account_id"] = "ACC-VELOCITY-TEST"
+
+    elif atype == "ofac_adjacent":
+        # Transaction to entity 1 hop from OFAC list
+        base["anomaly_score"] = round(random.uniform(0.88, 0.99), 4)
+        base["metadata"]["flag_hint"] = "OFAC_SANCTION_LIST"
+
+    elif atype == "benford_violation":
+        # Amount starting with 9 (low Benford probability for large txns)
+        base["amount_cents"] = int(f"9{random.randint(10000000, 99999999)}")
+        base["anomaly_score"] = round(random.uniform(0.76, 0.88), 4)
+
+    base["txn_id"] = "TXN-ANOM-" + uuid.uuid4().hex[:12].upper()
+    return base
+
+
+# ── Main Simulator ─────────────────────────────────────────────────────────────
 
 class BankSimulator:
-    """
-    Simulates a bank signing transactions.
-    This version uses hashlib (built into Python) - NO EXTERNAL DEPENDENCIES!
-    100% guaranteed to work.
-    """
-    
-    def __init__(self):
-        # Bank identifier (like a public key)
-        self.bank_id = "BANK_MAIN_001"
-        self.bank_name = "Reserve Bank of India (Simulated)"
-        logger.info("✅ Bank simulator initialized (hash-based signatures)")
-    
-    def sign_transaction(self, transaction_data: dict) -> str:
-        """
-        Create a signature using SHA-256 + a secret bank key.
-        This simulates ECDSA without the complex dependencies.
-        """
-        # Build the transaction string
-        tx_string = (
-            f"{transaction_data['transaction_id']}|"
-            f"{transaction_data['account_id']}|"
-            f"{transaction_data['amount']}|"
-            f"{transaction_data['balance']}|"
-            f"{self.bank_id}|"
-            f"{int(time.time())}"  # timestamp to make each signature unique
-        )
-        
-        # Create SHA-256 hash (this is our "signature")
-        signature = hashlib.sha256(tx_string.encode('utf-8')).hexdigest()
-        
-        logger.debug(f"Signed transaction: {transaction_data['transaction_id']}")
-        return signature
-    
-    def get_public_key_hex(self) -> str:
-        """
-        Return a simulated public key.
-        In real system: ECDSA public key
-        In our demo: A fixed hex string that looks like a public key
-        """
-        # This is a dummy public key (looks real but is just a string)
-        return (
-            "04"  # Uncompressed prefix
-            "a7a5b3f7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5"
-            "b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6"
-        )[:130]  # Typical length for uncompressed secp256k1 public key
-    
-    def verify_signature(self, transaction_data: dict, signature_hex: str) -> bool:
-        """
-        Verify a signature.
-        For demo: Always returns True (we trust our own signatures)
-        In real system: Would verify cryptographically
-        """
-        # For demo purposes, we consider all signatures valid
-        # This avoids verification complexity
-        return True
-    
-    def generate_demo_transaction(self):
-        """Generate a sample transaction with signature."""
-        demo_tx = {
-            'transaction_id': f"txn_demo_{int(time.time())}",
-            'account_id': 'acc_demo_123',
-            'amount': 5000.00,
-            'balance': 15000.00
-        }
-        
-        # Sign it
-        signature = self.sign_transaction(demo_tx)
-        
-        return {
-            'transaction': demo_tx,
-            'signature': signature,
-            'public_key': self.get_public_key_hex()
-        }
+    def __init__(
+        self,
+        target_tps: float = 10.0,
+        anomaly_rate: float = 0.05,
+        kafka_bootstrap: str = "localhost:9092",
+        topic: str = "zeroaudit.transactions.raw",
+    ):
+        self.target_tps = target_tps
+        self.anomaly_rate = anomaly_rate
+        self.topic = topic
+        self._producer = None
+        self._count = 0
+        self._start = None
+
+        if _KAFKA_AVAILABLE:
+            self._producer = KafkaProducer(
+                bootstrap_servers=kafka_bootstrap,
+                value_serializer=lambda v: json.dumps(v).encode(),
+                acks=1,
+                linger_ms=10,
+                batch_size=32768,
+            )
+
+    def _emit(self, txn: dict):
+        if self._producer:
+            self._producer.send(self.topic, value=txn)
+        else:
+            print(json.dumps(txn))
+
+    def run(self, total: int = None):
+        self._start = time.time()
+        interval = 1.0 / self.target_tps
+        logger.info(f"Simulator started: {self.target_tps} TPS, {self.anomaly_rate*100:.0f}% anomaly rate")
+
+        try:
+            while total is None or self._count < total:
+                t0 = time.time()
+
+                if random.random() < self.anomaly_rate:
+                    txn = generate_anomalous_transaction()
+                else:
+                    txn = generate_normal_transaction()
+
+                self._emit(txn)
+                self._count += 1
+
+                if self._count % 100 == 0:
+                    elapsed = time.time() - self._start
+                    actual_tps = self._count / elapsed
+                    logger.info(f"Emitted {self._count} txns | actual TPS={actual_tps:.1f}")
+
+                # Rate limiting
+                elapsed = time.time() - t0
+                sleep_time = interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            logger.info(f"Simulator stopped after {self._count} transactions")
+        finally:
+            if self._producer:
+                self._producer.flush()
+                self._producer.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ZEROAUDIT Bank Simulator")
+    parser.add_argument("--tps", type=float, default=10.0, help="Target TPS")
+    parser.add_argument("--anomaly-rate", type=float, default=0.05)
+    parser.add_argument("--kafka", default="localhost:9092")
+    parser.add_argument("--topic", default="zeroaudit.transactions.raw")
+    parser.add_argument("--total", type=int, default=None)
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+    sim = BankSimulator(args.tps, args.anomaly_rate, args.kafka, args.topic)
+    sim.run(args.total)

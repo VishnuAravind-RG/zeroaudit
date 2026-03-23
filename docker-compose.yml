@@ -1,121 +1,142 @@
-version: '3.8'
-
-networks:
-  zeroaudit-net:
-    driver: bridge
-
-volumes:
-  postgres-data:
-  kafka-data:
-  zookeeper-data:
+version: "3.9"
 
 services:
-  postgres:
-    image: postgres:15
-    container_name: zeroaudit-postgres
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./services/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
-    command:
-      - "postgres"
-      - "-c"
-      - "wal_level=logical"          # Enable logical replication for Debezium
-    networks:
-      - zeroaudit-net
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
+  # ── Apache Cassandra (LSM-Tree write absorber) ─────────────────────────────
+  cassandra:
+    image: cassandra:4.1
+    container_name: zeroaudit-cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: zeroaudit-cluster
+      CASSANDRA_DC: dc1
+      HEAP_NEWSIZE: 128M
+      MAX_HEAP_SIZE: 512M
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+      - ./services/cassandra/init.cql:/docker-entrypoint-initdb.d/init.cql
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  # ── Apache Zookeeper (Kafka dependency) ───────────────────────────────────
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.4.0
+    image: confluentinc/cp-zookeeper:7.6.0
     container_name: zeroaudit-zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
-    volumes:
-      - zookeeper-data:/var/lib/zookeeper/data
-    networks:
-      - zeroaudit-net
-    healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "2181"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
+  # ── Apache Kafka ─────────────────────────────────────────────────────────
   kafka:
-    image: confluentinc/cp-kafka:7.4.0
+    image: confluentinc/cp-kafka:7.6.0
     container_name: zeroaudit-kafka
     depends_on:
-      zookeeper:
-        condition: service_healthy
+      - zookeeper
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  # ── Kafka Topic Init ──────────────────────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: zeroaudit-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
     volumes:
-      - kafka-data:/var/lib/kafka/data
-    networks:
-      - zeroaudit-net
-    healthcheck:
-      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - ./services/kafka/create_topics.sh:/scripts/create_topics.sh
 
-  kafka-connect:
-    image: debezium/connect:2.4
-    container_name: zeroaudit-kafka-connect
+  # ── ZEROAUDIT Prover (SGX Enclave Prover) ────────────────────────────────
+  prover:
+    build:
+      context: .
+      dockerfile: Dockerfile.prover
+    container_name: zeroaudit-prover
     depends_on:
-      kafka:
+      cassandra:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
-    ports:
-      - "8083:8083"
-    environment:
-      BOOTSTRAP_SERVERS: kafka:9092
-      GROUP_ID: 1
-      CONFIG_STORAGE_TOPIC: connect_configs
-      OFFSET_STORAGE_TOPIC: connect_offsets
-      STATUS_STORAGE_TOPIC: connect_statuses
-      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
-      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
-    networks:
-      - zeroaudit-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: zeroaudit-kafka-ui
-    depends_on:
       kafka:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "8000:8000"
     environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-    networks:
-      - zeroaudit-net
+      KAFKA_BOOTSTRAP: kafka:29092
+      CASSANDRA_HOSTS: cassandra
+      CASSANDRA_KEYSPACE: zeroaudit
+      LOG_LEVEL: INFO
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      ANOMALY_THRESHOLD: "0.75"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  # ── ZEROAUDIT Verifier (External DMZ) ────────────────────────────────────
+  verifier:
+    build:
+      context: .
+      dockerfile: Dockerfile.verifier
+    container_name: zeroaudit-verifier
+    depends_on:
+      - kafka
+      - prover
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      LOG_LEVEL: INFO
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  # ── Bank Simulator ────────────────────────────────────────────────────────
+  simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.simulator
+    container_name: zeroaudit-simulator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      SIM_TPS: "15"
+      SIM_ANOMALY_RATE: "0.05"
+    restart: unless-stopped
+
+  # ── React Dashboard (Vite dev server) ────────────────────────────────────
+  dashboard:
+    image: node:20-alpine
+    container_name: zeroaudit-dashboard
+    working_dir: /app
+    volumes:
+      - ./dashboard:/app
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev -- --host"
+    depends_on:
+      - prover
+    environment:
+      VITE_API_URL: http://localhost:8000
+
+volumes:
+  cassandra_data:

@@ -1,1 +1,0 @@
-# Makes the prover directory a Python package
