@@ -124,7 +124,7 @@ class BankSimulator:
         self,
         target_tps: float = 10.0,
         anomaly_rate: float = 0.05,
-        kafka_bootstrap: str = "localhost:9092",
+        kafka_bootstrap: str = "kafka:29092",
         topic: str = "zeroaudit.transactions.raw",
     ):
         self.target_tps = target_tps
@@ -189,7 +189,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZEROAUDIT Bank Simulator")
     parser.add_argument("--tps", type=float, default=10.0, help="Target TPS")
     parser.add_argument("--anomaly-rate", type=float, default=0.05)
-    parser.add_argument("--kafka", default="localhost:9092")
+    parser.add_argument("--kafka", default="kafka:29092")
     parser.add_argument("--topic", default="zeroaudit.transactions.raw")
     parser.add_argument("--total", type=int, default=None)
     args = parser.parse_args()

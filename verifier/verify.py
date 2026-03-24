@@ -1,5 +1,5 @@
-"""
-verify.py — ZEROAUDIT External Verifier
+﻿"""
+verify.py â€” ZEROAUDIT External Verifier
 Consumes the committed topic and independently re-verifies:
   1. Ed25519 signature
   2. LWE binding hash chain integrity
@@ -12,9 +12,9 @@ import logging
 import time
 from typing import Optional
 
-from ..prover.crypto.signature import verify_signature
-from ..prover.crypto.commitment import get_store
-from ..prover.config.settings import settings
+from prover.crypto.signature import verify_signature
+from prover.crypto.commitment import get_store
+from prover.config.settings import settings
 
 logger = logging.getLogger("zeroaudit.verifier")
 
@@ -27,7 +27,7 @@ except ImportError:
 
 class ExternalVerifier:
     """
-    Independent verification service — runs in a separate process.
+    Independent verification service â€” runs in a separate process.
     Has NO access to master key, secret vector s, or raw amounts.
     Only verifies commitment envelope integrity via public key.
     """
@@ -52,7 +52,7 @@ class ExternalVerifier:
     def verify_envelope(self, committed_record: dict) -> dict:
         """
         Verify a single committed record from the Kafka topic.
-        Only uses public key — no secrets.
+        Only uses public key â€” no secrets.
         """
         txn_id = committed_record.get("txn_id", "?")
         sig_envelope = committed_record.get("signature", {})
@@ -116,7 +116,7 @@ class ExternalVerifier:
     def run(self):
         self._connect()
         if not self._consumer:
-            logger.info("No Kafka — verifier idle")
+            logger.info("No Kafka â€” verifier idle")
             return
 
         logger.info("External verifier started")
@@ -140,3 +140,5 @@ class ExternalVerifier:
 
     def recent_results(self, n: int = 50) -> list[dict]:
         return self._results[-n:]
+
+
