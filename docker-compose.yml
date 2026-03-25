@@ -123,20 +123,14 @@ services:
       SIM_ANOMALY_RATE: "0.05"
     restart: unless-stopped
 
-  # ── React Dashboard (Vite dev server) ────────────────────────────────────
+  # ── ZEROAUDIT Dashboard (Static HTML) ────────────────────────────────────
   dashboard:
-    image: node:20-alpine
+    build: ./dashboard
     container_name: zeroaudit-dashboard
-    working_dir: /app
-    volumes:
-      - ./dashboard:/app
     ports:
-      - "5173:5173"
-    command: sh -c "npm install && npm run dev -- --host"
+      - "3000:80"
     depends_on:
       - prover
-    environment:
-      VITE_API_URL: http://localhost:8000
 
 volumes:
   cassandra_data:
