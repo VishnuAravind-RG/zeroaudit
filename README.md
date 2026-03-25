@@ -1,170 +1,258 @@
-# ZEROAUDIT — Post-Quantum Zero-Knowledge Financial Audit
+# ZEROAUDIT
 
-> *Prove compliance. Reveal nothing.*
+**Post-quantum zero-knowledge financial audit system for Tier-1 banks.**
 
-ZEROAUDIT is a post-quantum zero-knowledge financial audit system built for Tier-1 banks. It solves the critical problem of exposing raw financial data to auditors by replacing data transfer with cryptographic proof.
+Prove compliance. Reveal nothing.
 
-- **No data leaves the bank** — only Lattice-based commitments.
-- **Post-quantum secure** — Learning With Errors (LWE), hard even for quantum computers.
-- **Hardware-enforced** — Intel SGX enclave isolates the prover.
-- **Privacy-preserving AI** — anomaly detection on metadata only, never on amounts.
+ZEROAUDIT eliminates the single largest attack surface in enterprise finance — the transfer of raw financial data to auditors — by replacing data with cryptographic proof. Transactions are committed inside an Intel SGX enclave using a Lattice-based (LWE) scheme. Auditors receive only the commitment ledger and verify integrity without ever seeing amounts, accounts, or counterparties.
 
 ---
 
-## 🔥 The Problem It Solves
+## The problem it solves
 
-**Traditional audit flow:**
-```
-Bank Data → Export → Transfer → Auditor sees everything → Breach risk
-```
+Traditional audit flow:
 
-**ZEROAUDIT flow:**
 ```
-Bank Data → Cryptographic Proof → Auditor verifies proof → Zero exposure
+Bank data → Export → Transfer → Auditor sees everything → Breach risk
 ```
 
-The auditor trusts only the mathematics and the bank's public key — no person, network, or system.
+ZEROAUDIT flow:
+
+```
+Bank data → LWE commitment (SGX) → Public Kafka topic → Auditor verifies proof
+```
+
+The auditor trusts the mathematics and the bank's public key — no person, network, or system.
 
 ---
 
-## 🧱 Architecture
+## Architecture
 
-| Layer | Technology | Why |
-|-------|------------|-----|
-| Write Storage | Apache Cassandra | LSM-tree, append-only, tamper-evident |
-| Change Capture | Debezium | WAL-level capture before application code |
-| Message Bus | Apache Kafka | Ordered, persistent, separate public/internal topics |
-| Secure Compute | Intel SGX Enclave | Hardware-encrypted RAM, zero trust |
+```
+
+┌─────────────────────────────────────────────────────────────┐
+│  Bank Perimeter (Internal)                                  │
+│                                                             │
+│  [Simulator] ──► (zeroaudit.transactions.raw)               │
+│                        │                                    │
+│                        ▼                                    │
+│                 [Prover (SGX Enclave)]                      │
+│                 - Verifies Signatures                       │
+│                 - AI Intent Engine (Metadata)               │
+│                 - LWE Lattice Commitment                    │
+│                 - Memory Burn (memset)                      │
+│                        │                                    │
+│                 [Cassandra] (Append-only Ledger)            │
+└────────────────────────┼────────────────────────────────────┘
+                         │ 
+                         │ LWE Commitments & Anomaly Scores
+                         │ (Zero PII)
+                         ▼
+             (zeroaudit.transactions.committed)
+                         │
+┌────────────────────────┼────────────────────────────────────┐
+│  External DMZ (Public) │                                    │
+│                        ▼                                    │
+│                 [Verifier API]                              │
+│                 - Validates LWE Params                      │
+│                 - Asserts PII = 0                           │
+│                 - Exposes REST Endpoints                    │
+│                        │                                    │
+│                        ▼                                    │
+│                 [Auditor Dashboard]                         │
+│                 - Live Telemetry & Ledger                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| Layer | Technology | Role |
+|---|---|---|
+| Write storage | Apache Cassandra 4.1 | Append-only LSM-tree ledger |
+| Message bus | Apache Kafka (Confluent 7.6) | Ordered, persistent, isolated topics |
+| Secure compute | Intel SGX (simulated) | Hardware-encrypted prover enclave |
 | Cryptography | LWE / Kyber-1024 | Post-quantum commitment scheme |
-| Signatures | Ed25519 / HMAC-SHA256 | Transaction authenticity |
-| Anomaly Detection | FP16 ONNX Autoencoder | Metadata-only, privacy-preserving |
-| Dashboard | Static HTML + Nginx | Terminal-style audit UI |
+| Anomaly detection | FP16 ONNX autoencoder | Metadata-only, privacy-preserving |
+| Verifier API | FastAPI + uvicorn | External DMZ — zero PII |
+| Dashboard | Static HTML + nginx | Real-time audit terminal |
 
 **Data flow:**
 
-1. Transactions are written to Cassandra (append-only).
-2. Debezium captures changes from the commit log and pushes to Kafka (internal topic).
-3. Prover inside SGX enclave reads raw transactions, verifies signatures, and generates LWE commitments.
-4. Commitments (zero-PII) are published to a public Kafka topic.
-5. Verifier reads commitments, validates LWE proofs, and serves the dashboard.
-6. Auditor sees only the commitment ledger and can verify any transaction via the terminal.
+1. The simulator produces ~15 TPS of synthetic bank transactions to the `zeroaudit.transactions.raw` Kafka topic (5% anomaly rate).
+2. The prover consumes raw transactions from inside the SGX enclave, verifies Ed25519 signatures, generates an LWE commitment, and publishes the commitment to `zeroaudit.transactions.committed`. Raw amounts never leave the enclave.
+3. The verifier (external DMZ) consumes the committed topic, validates LWE parameters and binding hash format, and populates in-memory ring buffers.
+4. The dashboard polls the verifier's FastAPI endpoints and renders live metrics, the commitment ledger, and the quarantine queue.
 
 ---
 
-## 🚀 Getting Started
+## Cryptographic guarantees
+
+- **Binding** — once commitment `C` is published, the prover cannot change the underlying value without detection.
+- **Hiding** — no one can recover the transaction amount or identity from `C`. The blinding factor and error vector are discarded inside the enclave.
+- **Post-quantum** — security rests on Learning With Errors (LWE), hard for both classical and quantum adversaries.
+- **Zero-knowledge** — the auditor receives proof of validity without ever seeing raw data.
+
+LWE parameters used: `n=256, k=2, q=3329, η=2` (Kyber-1024 profile).
+
+---
+
+## AI anomaly detection
+
+The intent engine runs entirely on transaction metadata — timestamps, account hashes, transaction types, velocity — never on raw amounts.
+
+- FP16 ONNX autoencoder; reconstruction loss is the anomaly score.
+- Score ≥ 0.75 → quarantine. Score ≥ 0.90 → critical flag.
+- Benford's Law analysis on binding hash leading digits.
+- Graph proximity to OFAC/RBI blacklists (hop count).
+- Behavioral biometrics on account velocity patterns.
+
+---
+
+## Getting started
 
 ### Prerequisites
 
-- Docker (≥ 20.10) and Docker Compose (≥ 2.0)
-- Git (optional, for cloning)
+- Docker ≥ 20.10
+- Docker Compose ≥ 2.0
 
-### Clone the repository
+### Run
 
 ```bash
 git clone https://github.com/VishnuAravind-RG/zeroaudit.git
 cd zeroaudit
+docker compose up --build -d
 ```
 
-### Build and run
+Cassandra and Kafka take ~30 seconds to become healthy. Monitor with:
 
 ```bash
-docker-compose up --build -d
+docker compose ps
+docker compose logs -f
 ```
 
-Wait for all containers to become healthy (especially Cassandra and Kafka). Monitor with:
+### Verify the system is working
 
 ```bash
-docker-compose ps
-docker-compose logs -f
+# Verifier health
+curl http://localhost:8001/health
+
+# Live stats — tps and kafka_lag_ms should be non-zero
+curl http://localhost:8001/stats
+
+# Recent committed transactions — should return a populated list
+curl http://localhost:8001/transactions
+
+# Quarantine queue
+curl http://localhost:8001/anomalies
 ```
 
-### Access the dashboard
+Expected output after ~60 seconds:
 
-Open your browser at [http://localhost:3000](http://localhost:3000)
+```json
+{
+  "tps": 92.8,
+  "total_commitments": 0,
+  "kafka_lag_ms": 139.5,
+  "pii_bytes": 0
+}
+```
 
-You'll see the terminal-style dashboard with real-time metrics, quarantine queue, and cryptographic ledger.
+`total_commitments` reflects the Cassandra persistent store; `tps` and the `/transactions` list reflect the verifier's in-memory ring buffer, which fills immediately.
+
+### Dashboard
+
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ---
 
-## 🔍 Using the System
+## Service endpoints
 
-- **Dashboard** — Shows pipeline telemetry, live transactions, quarantine list, and a verification terminal.
-- **Quarantine** — Transactions flagged by the AI engine appear here. Authorize or terminate them.
-- **Verification Terminal** — Enter any transaction ID from the ledger to recompute its LWE commitment and verify integrity.
-
-The prover automatically processes transactions generated by the simulator (5% anomaly rate). You can also inject your own transactions via the Kafka raw topic.
+| Service | Port | Description |
+|---|---|---|
+| Prover API | 8000 | Internal — commitment pipeline metrics |
+| Verifier API | 8001 | External DMZ — audit endpoints |
+| Dashboard | 3000 | Static HTML served by nginx |
+| Kafka | 9092 | External listener (host) |
+| Cassandra | 9042 | CQL interface |
 
 ---
 
-## 📁 Project Structure
+## Project structure
 
 ```
 zeroaudit/
-├── dashboard/               # Static HTML dashboard (nginx)
-├── prover/                  # Prover service (SGX-simulated)
-│   ├── crypto/              # LWE commitment + ECDSA
-│   ├── consumer.py          # Kafka consumer
-│   └── main.py              # FastAPI entrypoint
-├── verifier/                # Verifier service
-│   ├── kafka_client/        # Consumer for commitments
-│   └── anomaly_detector.py  # ONNX autoencoder
-├── simulator/               # Bank transaction simulator
-├── services/                # Config files for Cassandra, Kafka, etc.
-├── docker-compose.yml
+├── prover/
+│   ├── crypto/              # LWE commitment scheme, Ed25519 stubs
+│   ├── config/settings.py   # Shared settings (KAFKA_BOOTSTRAP, topic names)
+│   └── main.py              # FastAPI prover API
+├── verifier/
+│   ├── __main__.py          # Entry point for `python -m verifier.dashboard`
+│   ├── dashboard.py         # FastAPI verifier API (14 endpoints)
+│   ├── verify.py            # ExternalVerifier — LWE + PII checks
+│   ├── anomaly_detector.py  # ONNX autoencoder scoring
+│   ├── kafka_client/
+│   │   └── consumer.py      # VerifierKafkaConsumer with backoff reconnect
+│   └── components/          # Chart and sidebar data helpers
+├── simulator/               # Synthetic bank transaction generator
+├── dashboard/               # Static HTML + nginx Dockerfile
+├── services/
+│   ├── cassandra/init.cql   # Keyspace and table definitions
+│   └── kafka/create_topics.sh
 ├── Dockerfile.prover
 ├── Dockerfile.verifier
 ├── Dockerfile.simulator
-└── README.md
+└── docker-compose.yml
 ```
 
 ---
 
-## 🔒 Cryptographic Guarantees
+## Configuration
 
-| Property | Description |
-|----------|-------------|
-| **Binding** | Once a commitment `C` is published, the prover cannot change the underlying value without detection. |
-| **Hiding** | No one can recover the transaction amount or identity from `C` (blinding factor + error vector). |
-| **Post-Quantum** | Security rests on Learning With Errors (LWE) — resistant to both classical and quantum attacks. |
-| **Zero Knowledge** | Auditor receives proof of validity without ever seeing raw data. |
+All runtime configuration is passed via environment variables (see `docker-compose.yml`).
 
----
-
-## 🤖 AI Anomaly Detection (Intent Engine)
-
-- Autoencoder trained on metadata (timestamps, account IDs, types, velocity).
-- Reconstruction loss used as anomaly score:
-  - `≥ 0.75` → quarantine
-  - `≥ 0.90` → critical
-- Benford's Law analysis, graph proximity to blacklists, and behavioral biometrics.
-- **No raw amounts are ever processed by the ML model** — privacy fully preserved.
+| Variable | Default | Description |
+|---|---|---|
+| `KAFKA_BOOTSTRAP` | `kafka:29092` | Kafka broker address (internal network) |
+| `CASSANDRA_HOSTS` | `cassandra` | Cassandra contact point |
+| `CASSANDRA_KEYSPACE` | `zeroaudit` | Keyspace name |
+| `LOG_LEVEL` | `INFO` | Python log level |
+| `SIM_TPS` | `15` | Simulator transaction rate |
+| `SIM_ANOMALY_RATE` | `0.05` | Fraction of transactions flagged as anomalies |
+| `ANOMALY_THRESHOLD` | `0.75` | Score threshold for quarantine |
 
 ---
 
-## 📈 Real-World Impact
+## Implementation notes
 
-Designed for Indian financial regulations (RBI) with OFAC sanctions integration. The simulator injects 5% anomalies, reflecting realistic fraud rates.
+**`verifier/__main__.py`** — required because the container runs `python -m verifier.dashboard`. Without this file, Python sets `__name__ = "verifier.dashboard"` and the `if __name__ == "__main__"` block in `dashboard.py` never executes. `__main__.py` calls `uvicorn.run()` unconditionally and configures the root logger so application logs appear in `docker logs`.
+
+**Consumer group isolation** — the verifier generates a unique consumer group ID (`zeroaudit-verifier-{8 hex chars}`) on each process start. This prevents stale members from previous container runs stealing partition assignments, which would leave the new consumer with an empty assignment and zero messages despite being connected.
+
+**Backoff reconnect** — `VerifierKafkaConsumer._consume_loop()` retries the Kafka connection with exponential backoff (2 → 4 → 8 → … → 30 s). This handles the startup race between the verifier container and Kafka becoming ready, even when `depends_on: condition: service_healthy` is set.
+
+**`auto_offset_reset="earliest"`** — the verifier reads from the beginning of the topic on first connection so it catches up on messages produced before it started.
 
 ---
 
-## 🛠️ Development & Contributing
+## Regulatory context
+
+Designed with Indian financial regulation in mind (RBI guidelines) and OFAC sanctions list integration. The 5% simulator anomaly rate reflects realistic financial fraud rates. The zero-PII guarantee is enforced at every layer — the `pii_bytes: 0` assertion is checked on every message that crosses the enclave boundary.
+
+---
+
+## Contributing
 
 1. Fork the repository.
 2. Create a feature branch.
-3. Make your changes (keep the architecture intact).
-4. Test with `docker-compose up`.
-5. Submit a pull request.
+3. Run `docker compose up --build` and verify all endpoints return data.
+4. Submit a pull request with a description of what was changed and why.
+
+Keep the zero-PII invariant intact — no raw amounts, account numbers, or counterparty identities should appear in any log, metric, or API response.
 
 ---
 
-## 📄 License
+## License
 
-This project is provided for demonstration and educational purposes. Contact the author for licensing details.
+Provided for demonstration and educational purposes. Contact the author for licensing details.
 
 ---
 
-## 🙏 Acknowledgements
-
-- [NIST Post-Quantum Cryptography Standards (Kyber)](https://csrc.nist.gov/projects/post-quantum-cryptography)
-- Intel SGX SDK concepts (simulated in this prototype)
-- The open-source community for Apache Cassandra, Kafka, and Debezium
+*ZEROAUDIT — your data doesn't need to leave your vault to prove it's clean.*
