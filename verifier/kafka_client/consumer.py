@@ -1,15 +1,11 @@
 ﻿"""
-verifier/kafka_client/consumer.py â€” Verifier-side Kafka Consumer
+verifier/kafka_client/consumer.py — Verifier-side Kafka Consumer
 ZEROAUDIT Verifier Service
-
-Consumes from the committed and anomalies topics.
-Feeds records to the dashboard via an in-memory ring buffer
-and to the ExternalVerifier for independent signature checks.
-Zero PII at all times.
 """
 
 import json
 import time
+import uuid
 import logging
 import threading
 from collections import deque
@@ -24,14 +20,10 @@ try:
     _KAFKA_AVAILABLE = True
 except ImportError:
     _KAFKA_AVAILABLE = False
-    logger.warning("kafka-python not installed â€” verifier consumer running in stub mode")
+    logger.warning("kafka-python not installed — verifier consumer running in stub mode")
 
-
-# â”€â”€ Ring Buffer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class RingBuffer:
-    """Thread-safe fixed-size ring buffer for live dashboard feed."""
-
     def __init__(self, maxlen: int = 500):
         self._buf: deque = deque(maxlen=maxlen)
         self._lock = threading.Lock()
@@ -50,130 +42,131 @@ class RingBuffer:
             return len(self._buf)
 
 
-# â”€â”€ Verifier Kafka Consumer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 class VerifierKafkaConsumer:
-    """
-    Subscribes to:
-      - zeroaudit.transactions.committed  (all verified commitments)
-      - zeroaudit.anomalies               (quarantined transactions)
+    _GROUP_SUFFIX = uuid.uuid4().hex[:8]
 
-    Maintains:
-      - committed_buffer: RingBuffer of recent verified records
-      - anomaly_buffer:   RingBuffer of recent anomaly records
-      - Calls on_committed / on_anomaly callbacks for downstream processors
-    """
-
-    def __init__(
-        self,
-        on_committed: Optional[Callable] = None,
-        on_anomaly: Optional[Callable] = None,
-        buffer_size: int = 500,
-    ):
+    def __init__(self, on_committed=None, on_anomaly=None, buffer_size=500):
         self.committed_buffer = RingBuffer(buffer_size)
         self.anomaly_buffer = RingBuffer(buffer_size)
         self._on_committed = on_committed
         self._on_anomaly = on_anomaly
-        self._consumer: Optional[object] = None
+        self._consumer = None
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._thread = None
         self._stats = {
             "committed_received": 0,
             "anomalies_received": 0,
             "errors": 0,
             "start_time": time.time(),
+            "kafka_lag_ms": 0.0,
         }
+        self._group_id = f"zeroaudit-verifier-{self._GROUP_SUFFIX}"
 
-    def _connect(self):
+    def _connect(self) -> bool:
         if not _KAFKA_AVAILABLE:
-            return
+            logger.error("kafka-python is not installed")
+            return False
         try:
+            logger.info(f"Connecting to Kafka @ {settings.KAFKA_BOOTSTRAP} (group={self._group_id})")
             self._consumer = _KafkaConsumer(
                 settings.KAFKA_TOPIC_COMMITTED,
                 settings.KAFKA_TOPIC_ANOMALIES,
                 bootstrap_servers=settings.KAFKA_BOOTSTRAP,
-                group_id="zeroaudit-verifier-dashboard",
+                group_id=self._group_id,
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-                auto_offset_reset="latest",
+                auto_offset_reset="earliest",
                 enable_auto_commit=True,
                 consumer_timeout_ms=1000,
+                request_timeout_ms=15000,
+                session_timeout_ms=10000,
             )
-            logger.info(f"Verifier consumer connected to Kafka @ {settings.KAFKA_BOOTSTRAP}")
+            logger.info(f"Verifier consumer connected — topics: {settings.KAFKA_TOPIC_COMMITTED}, {settings.KAFKA_TOPIC_ANOMALIES}")
+            return True
         except Exception as e:
-            logger.error(f"Verifier Kafka connect failed: {e}")
+            logger.error(f"Kafka connect failed: {type(e).__name__}: {e}")
+            self._consumer = None
+            return False
 
     def _process(self, topic: str, record: dict):
-        """Route record to correct buffer and callback."""
         try:
-            # Ensure zero PII assertion
-            assert record.get("pii_bytes", 0) == 0, "PII DETECTED â€” dropping record"
-
+            assert record.get("pii_bytes", 0) == 0, "PII DETECTED"
             if topic == settings.KAFKA_TOPIC_COMMITTED:
                 self.committed_buffer.push(record)
                 self._stats["committed_received"] += 1
                 if self._on_committed:
                     self._on_committed(record)
-
             elif topic == settings.KAFKA_TOPIC_ANOMALIES:
                 self.anomaly_buffer.push(record)
                 self._stats["anomalies_received"] += 1
                 if self._on_anomaly:
                     self._on_anomaly(record)
-
         except AssertionError as e:
             self._stats["errors"] += 1
             logger.critical(f"PII ASSERTION FAILED on {record.get('txn_id')}: {e}")
         except Exception as e:
             self._stats["errors"] += 1
-            logger.error(f"Record processing error: {e}")
+            logger.error(f"Record processing error: {e}", exc_info=True)
 
     def _consume_loop(self):
+        backoff = 2.0
         while self._running:
-            if not self._consumer:
-                time.sleep(1)
-                continue
+            if self._consumer is None:
+                if not self._connect():
+                    logger.warning(f"Retrying in {backoff:.0f}s ...")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
+                backoff = 2.0
             try:
+                t0 = time.monotonic()
                 records = self._consumer.poll(timeout_ms=500)
+                self._stats["kafka_lag_ms"] = round((time.monotonic() - t0) * 1000, 1)
                 for tp, messages in records.items():
                     for msg in messages:
                         self._process(tp.topic, msg.value)
             except Exception as e:
                 self._stats["errors"] += 1
-                logger.error(f"Consume loop error: {e}")
-                time.sleep(1)
+                logger.error(f"Consume loop error: {type(e).__name__}: {e}", exc_info=True)
+                try:
+                    self._consumer.close()
+                except Exception:
+                    pass
+                self._consumer = None
+                time.sleep(2)
+        logger.info("VerifierKafkaConsumer loop exiting")
 
     def start(self):
+        if self._running:
+            return
         self._running = True
-        self._connect()
-        self._thread = threading.Thread(
-            target=self._consume_loop,
-            name="verifier-kafka-consumer",
-            daemon=True,
-        )
+        self._thread = threading.Thread(target=self._consume_loop, name="verifier-kafka-consumer", daemon=True)
         self._thread.start()
-        logger.info("VerifierKafkaConsumer started")
+        logger.info(f"VerifierKafkaConsumer thread started (id={self._thread.ident})")
 
     def stop(self):
         self._running = False
         if self._consumer:
-            self._consumer.close()
+            try:
+                self._consumer.close()
+            except Exception:
+                pass
         if self._thread:
             self._thread.join(timeout=5)
-        logger.info(f"VerifierKafkaConsumer stopped. Stats: {self._stats}")
 
     def tps(self) -> float:
         elapsed = time.time() - self._stats["start_time"]
         total = self._stats["committed_received"] + self._stats["anomalies_received"]
         return round(total / max(elapsed, 1), 1)
 
+    def tps_samples(self, n_seconds: int = 30) -> list:
+        return []
+
     def stats(self) -> dict:
-        return {
-            **self._stats,
-            "tps": self.tps(),
-            "committed_buffer_size": len(self.committed_buffer),
-            "anomaly_buffer_size": len(self.anomaly_buffer),
-            "pii_bytes": 0,
-        }
+        return {**self._stats, "tps": self.tps(),
+                "committed_buffer_size": len(self.committed_buffer),
+                "anomaly_buffer_size": len(self.anomaly_buffer),
+                "thread_alive": self._thread.is_alive() if self._thread else False,
+                "pii_bytes": 0}
 
     def recent_committed(self, n: int = 50) -> list:
         return self.committed_buffer.snapshot(n)
@@ -182,23 +175,8 @@ class VerifierKafkaConsumer:
         return self.anomaly_buffer.snapshot(n)
 
 
-# â”€â”€ Stub Consumer for dev without Kafka â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 class StubVerifierConsumer:
-    """
-    Generates fake committed + anomaly records for local development.
-    Drop-in replacement for VerifierKafkaConsumer.
-    """
-
-    def __init__(
-        self,
-        on_committed: Optional[Callable] = None,
-        on_anomaly: Optional[Callable] = None,
-        tps: float = 8.0,
-        anomaly_rate: float = 0.07,
-        buffer_size: int = 500,
-    ):
-        import uuid, random
+    def __init__(self, on_committed=None, on_anomaly=None, tps=8.0, anomaly_rate=0.07, buffer_size=500):
         self.committed_buffer = RingBuffer(buffer_size)
         self.anomaly_buffer = RingBuffer(buffer_size)
         self._on_committed = on_committed
@@ -206,43 +184,43 @@ class StubVerifierConsumer:
         self._tps = tps
         self._anomaly_rate = anomaly_rate
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._thread = None
         self._count = 0
+        self._stats = {"committed_received": 0, "anomalies_received": 0, "errors": 0,
+                       "start_time": time.time(), "kafka_lag_ms": 0.0}
 
     def start(self):
-        import uuid, random
+        import random, uuid as _uuid
         self._running = True
-
         def _loop():
             interval = 1.0 / self._tps
             types = ["RTGS", "NEFT", "WIRE_TRANSFER", "TRADE_SETTLEMENT", "FX_CONVERSION"]
             while self._running:
                 self._count += 1
                 is_anomaly = random.random() < self._anomaly_rate
-                score = round(random.uniform(0.82, 0.99), 4) if is_anomaly else round(random.uniform(0.0, 0.35), 4)
+                score = round(random.uniform(0.82, 0.99) if is_anomaly else random.uniform(0.0, 0.35), 4)
                 record = {
-                    "txn_id": f"TXN-{'ANOM' if is_anomaly else uuid.uuid4().hex[:8].upper()}",
-                    "binding_hash": uuid.uuid4().hex * 2,
+                    "txn_id": f"TXN-{'ANOM' if is_anomaly else _uuid.uuid4().hex[:8].upper()}",
+                    "binding_hash": _uuid.uuid4().hex * 2,
                     "size_kb": round(random.uniform(6.5, 9.2), 1),
                     "lwe_params": {"n": 256, "k": 2, "q": 3329, "eta": 2},
-                    "timestamp_ns": time.time_ns(),
-                    "pii_bytes": 0,
-                    "account_hash": uuid.uuid4().hex,
-                    "txn_type": random.choice(types),
+                    "timestamp_ns": time.time_ns(), "pii_bytes": 0,
+                    "account_hash": _uuid.uuid4().hex, "txn_type": random.choice(types),
                     "status": "QUARANTINED" if is_anomaly else "VERIFIED",
                     "anomaly_score": score,
                     "flag_reason": random.choice(["OFAC_SANCTION_LIST", "RBI_FLAG_2024", "BENFORD_VIOLATION"]) if is_anomaly else "NONE",
                     "pipeline_stage": "STUB",
                 }
                 self.committed_buffer.push(record)
+                self._stats["committed_received"] += 1
                 if self._on_committed:
                     self._on_committed(record)
                 if is_anomaly:
                     self.anomaly_buffer.push(record)
+                    self._stats["anomalies_received"] += 1
                     if self._on_anomaly:
                         self._on_anomaly(record)
                 time.sleep(interval)
-
         self._thread = threading.Thread(target=_loop, daemon=True, name="stub-verifier-consumer")
         self._thread.start()
         logger.info(f"StubVerifierConsumer started at {self._tps} TPS")
@@ -255,15 +233,15 @@ class StubVerifierConsumer:
     def tps(self) -> float:
         return self._tps
 
+    def tps_samples(self, n_seconds: int = 30) -> list:
+        return []
+
     def stats(self) -> dict:
-        return {
-            "mode": "stub",
-            "records_generated": self._count,
-            "tps": self._tps,
-            "committed_buffer_size": len(self.committed_buffer),
-            "anomaly_buffer_size": len(self.anomaly_buffer),
-            "pii_bytes": 0,
-        }
+        return {**self._stats, "mode": "stub", "tps": self._tps,
+                "committed_buffer_size": len(self.committed_buffer),
+                "anomaly_buffer_size": len(self.anomaly_buffer),
+                "thread_alive": self._thread.is_alive() if self._thread else False,
+                "pii_bytes": 0}
 
     def recent_committed(self, n: int = 50) -> list:
         return self.committed_buffer.snapshot(n)
@@ -272,13 +250,11 @@ class StubVerifierConsumer:
         return self.anomaly_buffer.snapshot(n)
 
 
-def get_verifier_consumer(
-    on_committed: Optional[Callable] = None,
-    on_anomaly: Optional[Callable] = None,
-) -> "VerifierKafkaConsumer | StubVerifierConsumer":
-    """Factory: real consumer if Kafka available, stub otherwise."""
+def get_verifier_consumer(on_committed=None, on_anomaly=None):
     if _KAFKA_AVAILABLE:
         return VerifierKafkaConsumer(on_committed, on_anomaly)
     return StubVerifierConsumer(on_committed, on_anomaly)
 
 
+ledger = []
+anomalies = []

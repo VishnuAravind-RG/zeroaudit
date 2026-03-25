@@ -1,7 +1,5 @@
 ﻿"""
-prover/consumer.py - ZEROAUDIT Prover Kafka Consumer
-Reads raw transactions from zeroaudit.transactions.raw,
-generates LWE commitments, publishes to zeroaudit.transactions.committed.
+prover/consumer.py – ZEROAUDIT Prover Kafka Consumer (with signature verification)
 """
 
 import json
@@ -12,6 +10,7 @@ from typing import Optional
 
 from .config.settings import settings
 from .crypto.commitment import get_store
+from .crypto.signature import verify_transaction_signature
 
 logger = logging.getLogger("zeroaudit.prover.consumer")
 
@@ -22,14 +21,7 @@ except ImportError:
     _KAFKA_AVAILABLE = False
     logger.error("kafka-python not installed")
 
-
 class ProverConsumer:
-    """
-    Consumes raw transactions from Kafka, generates LWE commitments,
-    publishes commitments to the public topic. Zero raw data ever
-    leaves this class into the public topic.
-    """
-
     def __init__(self):
         self._running = False
         self._consumer: Optional[object] = None
@@ -39,6 +31,7 @@ class ProverConsumer:
         self._stats = {
             "processed": 0,
             "errors": 0,
+            "signature_failures": 0,
             "start_time": time.time(),
         }
         self._timestamps = []
@@ -46,7 +39,6 @@ class ProverConsumer:
     def _connect(self):
         if not _KAFKA_AVAILABLE:
             raise RuntimeError("kafka-python not installed")
-
         retries = 0
         while retries < 10:
             try:
@@ -69,19 +61,26 @@ class ProverConsumer:
                 retries += 1
                 logger.warning(f"Kafka connect attempt {retries}/10 failed: {e}")
                 time.sleep(3)
-
         raise RuntimeError("ProverConsumer could not connect to Kafka after 10 retries")
 
     def _process(self, record: dict):
-        """Generate LWE commitment and publish to committed topic."""
+        """Verify signature, then generate LWE commitment."""
         try:
+            # 1. Signature verification (INGRESS FIREWALL)
+            if not verify_transaction_signature(record):
+                logger.error(f"Signature verification FAILED for {record.get('txn_id')} – transaction DROPPED")
+                with self._lock:
+                    self._stats["signature_failures"] += 1
+                return  # do not process further
+
+            # 2. Extract fields
             txn_id = record.get("txn_id") or record.get("transaction_id", "unknown")
             amount_cents = int(record.get("amount_cents", record.get("amount", 0) * 100))
             account_id = record.get("account_id", "unknown")
             txn_type = record.get("txn_type", record.get("type", "UNKNOWN"))
             anomaly_score = float(record.get("anomaly_score", 0.0))
 
-            # Generate LWE commitment (store handles crypto)
+            # 3. Generate LWE commitment (store handles crypto)
             committed = self._store.add(
                 txn_id=txn_id,
                 amount_cents=amount_cents,
@@ -90,18 +89,17 @@ class ProverConsumer:
                 anomaly_score=anomaly_score,
             )
 
-            # Publish zero-PII commitment to public topic
+            # 4. Publish zero-PII commitment to public topic
             public_record = committed.to_export_dict()
             self._producer.send(settings.KAFKA_TOPIC_COMMITTED, value=public_record)
 
-            # If anomaly, also publish to anomalies topic
+            # 5. If anomaly, also publish to anomalies topic
             if anomaly_score >= settings.ANOMALY_THRESHOLD:
                 self._producer.send(settings.KAFKA_TOPIC_ANOMALIES, value=public_record)
 
             with self._lock:
                 self._stats["processed"] += 1
                 self._timestamps.append(time.time())
-                # Keep only last 60 seconds of timestamps
                 cutoff = time.time() - 60
                 self._timestamps = [t for t in self._timestamps if t > cutoff]
 
@@ -111,14 +109,12 @@ class ProverConsumer:
             logger.error(f"ProverConsumer process error on {record}: {e}")
 
     def run(self):
-        """Main loop - called in a daemon thread by main.py."""
         self._running = True
         try:
             self._connect()
         except RuntimeError as e:
             logger.error(f"ProverConsumer failed to start: {e}")
             return
-
         logger.info("ProverConsumer run loop started")
         while self._running:
             try:
@@ -140,7 +136,6 @@ class ProverConsumer:
         logger.info(f"ProverConsumer stopped. Stats: {self._stats}")
 
     def tps(self) -> float:
-        """Real TPS from sliding 30s window."""
         with self._lock:
             cutoff = time.time() - 30
             recent = [t for t in self._timestamps if t > cutoff]

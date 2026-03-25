@@ -1,4 +1,4 @@
-﻿
+
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
   *{box-sizing:border-box;margin:0;padding:0}
@@ -77,7 +77,7 @@
   .pipe-icon.dead{border-color:var(--red);color:var(--red);background:var(--red-dim)}
   .pipe-label{font-family:var(--mono);font-size:9px;color:var(--text3);letter-spacing:1px;text-align:center}
   .pipe-arrow{flex:1;height:1px;background:linear-gradient(90deg,var(--cyan2),var(--border));position:relative;min-width:20px}
-  .pipe-arrow::after{content:'â–¶';position:absolute;right:-6px;top:-7px;font-size:10px;color:var(--cyan2)}
+  .pipe-arrow::after{content:'▶';position:absolute;right:-6px;top:-7px;font-size:10px;color:var(--cyan2)}
 
   /* LIVE TABLE */
   .live-table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
@@ -272,9 +272,9 @@
           <span style="font-family:var(--mono);font-size:9px;color:var(--text3)">TPS HISTORY</span>
         </div>
         <div style="margin-left:auto;display:flex;gap:16px">
-          <span style="font-family:var(--mono);font-size:9px;color:var(--green)">â— WAL STREAMING ACTIVE</span>
-          <span style="font-family:var(--mono);font-size:9px;color:var(--amber)">â— SGX MEE 78% LOAD</span>
-          <span style="font-family:var(--mono);font-size:9px;color:var(--cyan)">â— KAFKA LAG 0ms</span>
+          <span style="font-family:var(--mono);font-size:9px;color:var(--green)">● WAL STREAMING ACTIVE</span>
+          <span style="font-family:var(--mono);font-size:9px;color:var(--amber)">● SGX MEE 78% LOAD</span>
+          <span style="font-family:var(--mono);font-size:9px;color:var(--cyan)">● KAFKA LAG 0ms</span>
         </div>
       </div>
     </div>
@@ -307,7 +307,7 @@
 <!-- ============ TAB 2: INTENT ENGINE ============ -->
 <div id="tab-intent" class="main section-hidden">
   <div style="padding:8px 14px;background:#1a0505;border:1px solid var(--red);border-radius:4px;font-family:var(--mono);font-size:10px;color:var(--red);letter-spacing:1px" id="alert-banner">
-    âš  CRITICAL â€” AUTOENCODER RECONSTRUCTION LOSS THRESHOLD EXCEEDED â€” 2 TRANSACTIONS IN QUARANTINE
+    ⚠ CRITICAL — AUTOENCODER RECONSTRUCTION LOSS THRESHOLD EXCEEDED — 2 TRANSACTIONS IN QUARANTINE
   </div>
 
   <div class="two-col">
@@ -350,9 +350,9 @@
           <svg class="graph-svg" id="graph-svg"></svg>
         </div>
         <div style="margin-top:8px;font-family:var(--mono);font-size:9px;color:var(--text3)">
-          <span style="color:var(--red)">â– </span> BLACKLISTED ENTITY &nbsp;
-          <span style="color:var(--amber)">â– </span> HIGH-RISK PROXY &nbsp;
-          <span style="color:var(--cyan)">â– </span> FLAGGED ACCOUNT
+          <span style="color:var(--red)">■</span> BLACKLISTED ENTITY &nbsp;
+          <span style="color:var(--amber)">■</span> HIGH-RISK PROXY &nbsp;
+          <span style="color:var(--cyan)">■</span> FLAGGED ACCOUNT
         </div>
       </div>
     </div>
@@ -364,11 +364,11 @@
       <div class="panel-body">
         <div class="benford-chart" id="benford-chart"></div>
         <div style="display:flex;gap:12px;margin-top:6px;font-family:var(--mono);font-size:9px;color:var(--text3)">
-          <span><span style="color:var(--border2)">â– </span> EXPECTED (BENFORD)</span>
-          <span><span style="color:var(--amber)">â– </span> OBSERVED (ACCOUNT)</span>
+          <span><span style="color:var(--border2)">■</span> EXPECTED (BENFORD)</span>
+          <span><span style="color:var(--amber)">■</span> OBSERVED (ACCOUNT)</span>
         </div>
         <div style="margin-top:10px;padding:8px;background:var(--obsidian);border:1px solid var(--red);border-radius:2px;font-family:var(--mono);font-size:9px;color:var(--red)">
-          DEVIATION SCORE: 0.847 â€” EXCEEDS 3Ïƒ THRESHOLD
+          DEVIATION SCORE: 0.847 — EXCEEDS 3σ THRESHOLD
         </div>
       </div>
     </div>
@@ -399,7 +399,7 @@
   <div class="panel">
     <div class="panel-header">
       <span class="panel-title">VERIFICATION TERMINAL</span>
-      <span class="panel-sub">AUDITOR ACCESS â€” READ ONLY</span>
+      <span class="panel-sub">AUDITOR ACCESS — READ ONLY</span>
     </div>
     <div class="panel-body">
       <div class="verify-terminal">
@@ -419,7 +419,7 @@
   <div class="panel">
     <div class="panel-header">
       <span class="panel-title">IMMUTABLE COMMITMENT LEDGER</span>
-      <span class="panel-sub">S3 PARQUET â€” AIR-GAPPED VIEW</span>
+      <span class="panel-sub">S3 PARQUET — AIR-GAPPED VIEW</span>
     </div>
     <div class="panel-body" style="padding:8px">
       <div class="ledger-list" id="ledger-list"></div>
@@ -430,8 +430,8 @@
 <!-- TICKER -->
 <div class="ticker">
   <span class="ticker-inner" id="ticker-text">
-    â— ENCLAVE ATTESTATION: VERIFIED &nbsp;&nbsp; â— KAFKA CONSUMER LAG: 0ms &nbsp;&nbsp; â— LAST COMMITMENT: VALID &nbsp;&nbsp; â— ECDSA VERIFICATION: PASS &nbsp;&nbsp; â— LWE SEAL: INTACT &nbsp;&nbsp; â— MEMSET(0) PROTOCOL: ARMED &nbsp;&nbsp; â— BENFORD MONITOR: ACTIVE &nbsp;&nbsp; â— ISOLATION FOREST: TRAINED &nbsp;&nbsp; â— WAL STREAM: LIVE &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-    â— ENCLAVE ATTESTATION: VERIFIED &nbsp;&nbsp; â— KAFKA CONSUMER LAG: 0ms &nbsp;&nbsp; â— LAST COMMITMENT: VALID &nbsp;&nbsp; â— ECDSA VERIFICATION: PASS &nbsp;&nbsp; â— LWE SEAL: INTACT &nbsp;&nbsp; â— MEMSET(0) PROTOCOL: ARMED &nbsp;&nbsp; â— BENFORD MONITOR: ACTIVE &nbsp;&nbsp; â— ISOLATION FOREST: TRAINED &nbsp;&nbsp; â— WAL STREAM: LIVE
+    ● ENCLAVE ATTESTATION: VERIFIED &nbsp;&nbsp; ● KAFKA CONSUMER LAG: 0ms &nbsp;&nbsp; ● LAST COMMITMENT: VALID &nbsp;&nbsp; ● ECDSA VERIFICATION: PASS &nbsp;&nbsp; ● LWE SEAL: INTACT &nbsp;&nbsp; ● MEMSET(0) PROTOCOL: ARMED &nbsp;&nbsp; ● BENFORD MONITOR: ACTIVE &nbsp;&nbsp; ● ISOLATION FOREST: TRAINED &nbsp;&nbsp; ● WAL STREAM: LIVE &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    ● ENCLAVE ATTESTATION: VERIFIED &nbsp;&nbsp; ● KAFKA CONSUMER LAG: 0ms &nbsp;&nbsp; ● LAST COMMITMENT: VALID &nbsp;&nbsp; ● ECDSA VERIFICATION: PASS &nbsp;&nbsp; ● LWE SEAL: INTACT &nbsp;&nbsp; ● MEMSET(0) PROTOCOL: ARMED &nbsp;&nbsp; ● BENFORD MONITOR: ACTIVE &nbsp;&nbsp; ● ISOLATION FOREST: TRAINED &nbsp;&nbsp; ● WAL STREAM: LIVE
   </span>
 </div>
 
@@ -522,7 +522,7 @@ function renderTxnTable(){
       <td style="font-family:var(--mono);font-size:10px;color:var(--text)">${t.txnId}</td>
       <td style="font-family:var(--mono);font-size:10px">${t.acc}</td>
       <td>${typeBadge}</td>
-      <td class="hash-cell">${t.commitment.slice(0,24)}â€¦</td>
+      <td class="hash-cell">${t.commitment.slice(0,24)}…</td>
       <td style="font-family:var(--mono);font-size:9px;color:var(--text3)">${t.ts.slice(11)}</td>
       <td>${statusBadge}</td>
     </tr>`;
@@ -554,8 +554,8 @@ function renderQuarantine(){
         <span class="qitem-id">${q.txnId}</span>
         <span class="qitem-score">LOSS: ${q.score}</span>
       </div>
-      <div class="qitem-detail">${q.acc} â€¢ ${q.type} â€¢ ${q.ts.slice(11)}</div>
-      <div class="qitem-detail" style="color:var(--red);margin-top:3px">âš  ${q.reason}</div>
+      <div class="qitem-detail">${q.acc} • ${q.type} • ${q.ts.slice(11)}</div>
+      <div class="qitem-detail" style="color:var(--red);margin-top:3px">⚠ ${q.reason}</div>
     </div>`).join('');
 }
 
@@ -572,7 +572,7 @@ function selectQ(i){
       <div class="metric-bar-track"><div class="metric-bar-fill red" style="width:${score*100}%"></div></div>
     </div>
     <div class="metric-bar-row">
-      <div class="metric-bar-label"><span>BENFORD DEVIATION</span><span style="color:var(--amber)">+3.2Ïƒ</span></div>
+      <div class="metric-bar-label"><span>BENFORD DEVIATION</span><span style="color:var(--amber)">+3.2σ</span></div>
       <div class="metric-bar-track"><div class="metric-bar-fill amber" style="width:85%"></div></div>
     </div>
     <div class="metric-bar-row">
@@ -587,8 +587,8 @@ function selectQ(i){
       <div>REASON <span style="color:var(--red)">${q.reason.toUpperCase()}</span></div>
     </div>
     <div class="action-row">
-      <button class="btn authorize" onclick="authorizeQ(${i})">âœ“ AUTHORIZE</button>
-      <button class="btn terminate" onclick="terminateQ(${i})">âœ— TERMINATE</button>
+      <button class="btn authorize" onclick="authorizeQ(${i})">✓ AUTHORIZE</button>
+      <button class="btn terminate" onclick="terminateQ(${i})">✗ TERMINATE</button>
     </div>`;
   renderGraph(q.acc, graphProx);
   renderQuarantine();
@@ -600,7 +600,7 @@ function authorizeQ(i){
   state.quarantine.splice(i,1);
   state.quarantineCount=Math.max(0,state.quarantineCount-1);
   state.selectedQ=null;
-  document.getElementById('breakdown-panel').innerHTML='<div style="color:var(--green);font-family:var(--mono);font-size:10px;text-align:center;padding:40px">TRANSACTION AUTHORIZED â€” MOVED TO VAULT</div>';
+  document.getElementById('breakdown-panel').innerHTML='<div style="color:var(--green);font-family:var(--mono);font-size:10px;text-align:center;padding:40px">TRANSACTION AUTHORIZED — MOVED TO VAULT</div>';
   renderQuarantine(); renderMetrics();
 }
 
@@ -608,7 +608,7 @@ function terminateQ(i){
   state.quarantine.splice(i,1);
   state.quarantineCount=Math.max(0,state.quarantineCount-1);
   state.selectedQ=null;
-  document.getElementById('breakdown-panel').innerHTML='<div style="color:var(--red);font-family:var(--mono);font-size:10px;text-align:center;padding:40px">TRANSACTION TERMINATED â€” REPORTED TO INFOSEC</div>';
+  document.getElementById('breakdown-panel').innerHTML='<div style="color:var(--red);font-family:var(--mono);font-size:10px;text-align:center;padding:40px">TRANSACTION TERMINATED — REPORTED TO INFOSEC</div>';
   renderQuarantine(); renderMetrics();
 }
 
@@ -665,7 +665,7 @@ function renderLedger(){
         <span>ACCOUNT: <span>${c.acc}</span></span>
         <span>TYPE: <span>${c.type}</span></span>
         <span>TIME: <span>${c.ts.slice(11)}</span></span>
-        <span>SEAL: <span>LWE-LATTICE âœ“</span></span>
+        <span>SEAL: <span>LWE-LATTICE ✓</span></span>
       </div>
     </div>`).join('');
   document.getElementById('ledger-total').textContent=state.commitments.length;
@@ -684,15 +684,15 @@ function runVerify(){
       const c=found.commitment||found.commitment;
       output.innerHTML+=`<span class="val">QUERYING HSM... REGENERATING BLINDING FACTOR r...</span><br>`;
       setTimeout(()=>{
-        output.innerHTML+=`<span class="val">RUNNING C = AÂ·s + e (LWE LATTICE)...</span><br>`;
+        output.innerHTML+=`<span class="val">RUNNING C = A·s + e (LWE LATTICE)...</span><br>`;
         setTimeout(()=>{
-          output.innerHTML+=`<span class="ok">âœ“ VALIDATED: LWE PROOF INTACT</span><br>`;
+          output.innerHTML+=`<span class="ok">✓ VALIDATED: LWE PROOF INTACT</span><br>`;
           output.innerHTML+=`<span class="val">COMMITMENT: ${(found.commitment||randHex(64)).slice(0,48)}...</span><br>`;
           output.innerHTML+=`<span style="color:var(--text3)">PII REVEALED: NONE | RAW AMOUNT: HIDDEN | SEAL: INTACT</span>`;
         },600);
       },500);
     } else {
-      output.innerHTML+=`<span class="err">âœ— TRANSACTION NOT FOUND IN LEDGER</span><br>`;
+      output.innerHTML+=`<span class="err">✗ TRANSACTION NOT FOUND IN LEDGER</span><br>`;
       output.innerHTML+=`<span style="color:var(--text3)">TIP: copy a transaction id from the ledger below</span>`;
     }
   },400);
@@ -725,5 +725,3 @@ renderBenford();
 setInterval(mainLoop, 2200);
 mainLoop();
 </script>
-
-

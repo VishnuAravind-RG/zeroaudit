@@ -99,14 +99,18 @@ services:
       dockerfile: Dockerfile.verifier
     container_name: zeroaudit-verifier
     depends_on:
-      - kafka
-      - prover
+      kafka:
+        condition: service_healthy   # FIX: wait for Kafka to be ready, not just started
+      prover:
+        condition: service_started
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
       LOG_LEVEL: INFO
     env_file:
       - .env
     restart: unless-stopped
+    ports:
+      - "8001:8001"
 
   # ── Bank Simulator ────────────────────────────────────────────────────────
   simulator:
@@ -130,7 +134,7 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      - prover
+      - verifier
 
 volumes:
   cassandra_data:
