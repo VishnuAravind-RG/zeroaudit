@@ -28,41 +28,7 @@ The auditor trusts the mathematics and the bank's public key — no person, netw
 
 ## Architecture
 
-```
-
-┌─────────────────────────────────────────────────────────────┐
-│  Bank Perimeter (Internal)                                  │
-│                                                             │
-│  [Simulator] ──► (zeroaudit.transactions.raw)               │
-│                        │                                    │
-│                        ▼                                    │
-│                 [Prover (SGX Enclave)]                      │
-│                 - Verifies Signatures                       │
-│                 - AI Intent Engine (Metadata)               │
-│                 - LWE Lattice Commitment                    │
-│                 - Memory Burn (memset)                      │
-│                        │                                    │
-│                 [Cassandra] (Append-only Ledger)            │
-└────────────────────────┼────────────────────────────────────┘
-                         │ 
-                         │ LWE Commitments & Anomaly Scores
-                         │ (Zero PII)
-                         ▼
-             (zeroaudit.transactions.committed)
-                         │
-┌────────────────────────┼────────────────────────────────────┐
-│  External DMZ (Public) │                                    │
-│                        ▼                                    │
-│                 [Verifier API]                              │
-│                 - Validates LWE Params                      │
-│                 - Asserts PII = 0                           │
-│                 - Exposes REST Endpoints                    │
-│                        │                                    │
-│                        ▼                                    │
-│                 [Auditor Dashboard]                         │
-│                 - Live Telemetry & Ledger                   │
-└─────────────────────────────────────────────────────────────┘
-```
+![ZEROAUDIT Architecture](https://github.com/VishnuAravind-RG/zeroaudit/blob/main/assets/arch.png?raw=true)
 
 | Layer | Technology | Role |
 |---|---|---|
