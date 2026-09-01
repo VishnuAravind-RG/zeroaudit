@@ -1,69 +1,177 @@
 """
-lwe.py — Post-Quantum Learning With Errors (LWE) Commitment Engine
+lwe.py - Post-Quantum Module-LWE Commitment Engine
 ZEROAUDIT Cryptographic Core
 
-Implements:
-  - LWE key generation (public matrix A, secret vector s, error vector e)
-  - Commitment: C = A·s + e  (mod q)
-  - Binding: HMAC-SHA256 randomness derivation from master key + txn_id
-  - Verification: recompute and bitwise compare
-  - No PII ever touches this module — only numeric amounts and IDs
+Implements a binding + hiding commitment scheme over the ring
+R_q = Z_q[X]/(X^N + 1), under the Module-LWE hardness assumption
+(Kyber-style parameter profile).
 
-Parameters (Kyber-512 inspired):
-  n = 256   (polynomial degree)
-  k = 2     (module rank → effective dimension = n*k = 512)
-  q = 3329  (prime modulus)
-  eta = 2   (CBD noise parameter)
+Scheme
+------
+KeyGen:
+    A  = expand(seed)               A in R_q^{k x k}
+    s  = CBD(eta)                   secret,  s in R_q^k
+    e  = CBD(eta)                   error,   e in R_q^k
+    t  = A.s + e                    public,  t in R_q^k
+    public key = (seed, t)
+
+Commit(m, txn_id):
+    r    = CBD(HMAC(K_master, txn_id))      blinding vector
+    e1   = CBD(...)                          error for u
+    e2   = CBD(...)                          error for v
+    u    = A^T.r + e1
+    v    = <t, r> + e2 + encode(m)
+    C    = (u, v)
+    binding_hash = SHA3-256(C)
+
+Open(C, m, txn_id):  recompute C and compare in constant time.
+
+Security properties
+-------------------
+  binding  - encode() injects the FULL 64-bit amount, one bit per
+             coefficient scaled by floor(q/2). Two distinct amounts
+             therefore differ in at least one coefficient by ~q/2,
+             which no CBD(eta=2) error term can bridge.
+  hiding   - (u, v) is pseudorandom under Module-LWE; the blinding vector
+             and error terms derive from a secret master key and are
+             discarded after use.
+  pq       - reduces to Module-LWE, believed hard for quantum adversaries.
+
+Parameters (Kyber-512 profile):
+    n = 256   polynomial degree
+    k = 2     module rank  (effective lattice dimension n*k = 512)
+    q = 3329  prime modulus
+    eta = 2   centered binomial noise parameter
+
+Performance
+-----------
+Ring multiplication uses a NumPy negacyclic convolution when NumPy is
+available and falls back to a pure-Python schoolbook loop otherwise.
+Both paths are bit-identical; the fallback exists so the crypto core
+carries no hard third-party dependency.
+
+No PII ever enters this module - only integer amounts and opaque IDs.
 """
 
 import os
 import hmac
-import hashlib
-import struct
-import base64
-import json
 import time
-from typing import Tuple
+import base64
+import struct
+import hashlib
+import logging
+from typing import Optional
 
-# ── LWE Parameters ────────────────────────────────────────────────────────────
-N = 256          # lattice dimension per module
-K = 2            # module rank  (total dim = N*K = 512)
+logger = logging.getLogger("zeroaudit.lwe")
+
+try:
+    import numpy as _np
+    _NUMPY = True
+except ImportError:  # pragma: no cover - only on minimal installs
+    _NUMPY = False
+    logger.warning("NumPy unavailable - falling back to pure-Python ring arithmetic")
+
+# -- LWE parameters -----------------------------------------------------------
+N = 256          # polynomial degree
+K = 2            # module rank  (total lattice dimension = N*K = 512)
 Q = 3329         # prime modulus
 ETA = 2          # centered binomial noise parameter
-SEED_LEN = 32    # bytes for PRNG seed
+SEED_LEN = 32    # bytes of public-matrix seed
+
+AMOUNT_BITS = 64  # full width of the committed amount (was 32 - see CHANGELOG)
+
+if AMOUNT_BITS > N:  # pragma: no cover - guards a future parameter change
+    raise ValueError("AMOUNT_BITS exceeds ring degree N")
 
 
-# ── Low-level Math ─────────────────────────────────────────────────────────────
+# -- Ring arithmetic ----------------------------------------------------------
 
-def _mod_q(x: int) -> int:
-    return x % Q
+def _poly_add(a: list, b: list) -> list:
+    return [(x + y) % Q for x, y in zip(a, b)]
 
 
-def _cbd(seed: bytes, nonce: int, length: int) -> list[int]:
-    """Centered Binomial Distribution sampler (eta=2).
-    Produces coefficients in [-eta, +eta], lifted to [0, q).
-    """
-    # Expand seed via SHAKE-256
-    import hashlib
-    xof = hashlib.shake_256()
-    xof.update(seed)
-    xof.update(struct.pack("<H", nonce))
-    buf = xof.digest(length * ETA)
-
-    result = []
-    for i in range(length):
-        byte = buf[i % len(buf)]
-        # sum 2 bits minus sum of next 2 bits
-        a = bin(byte & 0x03).count('1') + bin((byte >> 2) & 0x03).count('1')
-        b = bin((byte >> 4) & 0x03).count('1') + bin((byte >> 6) & 0x03).count('1')
-        val = (a - b) % Q
-        result.append(val)
+def _poly_mul_schoolbook(a: list, b: list) -> list:
+    """Negacyclic multiply in Z_q[X]/(X^N + 1). Reference implementation."""
+    result = [0] * N
+    for i in range(N):
+        ai = a[i]
+        if ai == 0:
+            continue
+        for j in range(N):
+            idx = i + j
+            if idx >= N:
+                result[idx - N] = (result[idx - N] - ai * b[j]) % Q
+            else:
+                result[idx] = (result[idx] + ai * b[j]) % Q
     return result
 
 
-def _gen_matrix_A(seed: bytes) -> list[list[list[int]]]:
-    """Generate public matrix A ∈ R_q^{k×k} from seed (XOF expansion)."""
-    import hashlib
+def _poly_mul_numpy(a: list, b: list) -> list:
+    """Negacyclic multiply via full convolution + fold. Identical output.
+
+    For f, g of degree < N the product mod (X^N + 1) folds the high half
+    back with a sign flip, because X^N = -1 in the ring:
+        c = conv(f, g)                     length 2N-1
+        result[i] = c[i] - c[i + N]
+    Coefficients stay well inside int64: N * (q-1)^2 is about 2.8e9.
+    """
+    conv = _np.convolve(
+        _np.asarray(a, dtype=_np.int64),
+        _np.asarray(b, dtype=_np.int64),
+    )
+    folded = conv[:N].copy()
+    folded[: N - 1] -= conv[N:]
+    return (folded % Q).tolist()
+
+
+def _poly_mul(a: list, b: list) -> list:
+    return _poly_mul_numpy(a, b) if _NUMPY else _poly_mul_schoolbook(a, b)
+
+
+def _module_mul_add(A: list, s: list, e: list) -> list:
+    """t = A.s + e  over R_q^k."""
+    out = []
+    for i in range(K):
+        acc = [0] * N
+        for j in range(K):
+            acc = _poly_add(acc, _poly_mul(A[i][j], s[j]))
+        out.append(_poly_add(acc, e[i]))
+    return out
+
+
+def _inner_product(t: list, r: list) -> list:
+    """<t, r> = sum_i t[i] * r[i]  over R_q."""
+    acc = [0] * N
+    for i in range(K):
+        acc = _poly_add(acc, _poly_mul(t[i], r[i]))
+    return acc
+
+
+# -- Samplers -----------------------------------------------------------------
+
+def _cbd(seed: bytes, nonce: int, length: int) -> list:
+    """Centered binomial sampler, eta=2.
+
+    Consumes 4 fresh bits per coefficient: b = popcount(lo2) - popcount(hi2),
+    giving b in [-2, 2] with binomial weights (1,4,6,4,1)/16, lifted to [0, q).
+    """
+    xof = hashlib.shake_256()
+    xof.update(seed)
+    xof.update(struct.pack("<H", nonce & 0xFFFF))
+    buf = xof.digest((length + 1) // 2)          # 2 coefficients per byte
+
+    out = []
+    for i in range(length):
+        byte = buf[i >> 1]
+        nib = (byte & 0x0F) if (i & 1) == 0 else (byte >> 4)
+        a = (nib & 1) + ((nib >> 1) & 1)
+        b = ((nib >> 2) & 1) + ((nib >> 3) & 1)
+        out.append((a - b) % Q)
+    return out
+
+
+def _gen_matrix_A(seed: bytes) -> list:
+    """Expand public matrix A in R_q^{k x k} from a seed by rejection sampling."""
     A = []
     for i in range(K):
         row = []
@@ -71,162 +179,177 @@ def _gen_matrix_A(seed: bytes) -> list[list[list[int]]]:
             xof = hashlib.shake_128()
             xof.update(seed)
             xof.update(bytes([i, j]))
-            buf = xof.digest(N * 3)  # 3 bytes per coeff for rejection sampling
-            poly = []
-            idx = 0
-            while len(poly) < N and idx + 2 < len(buf):
-                val = ((buf[idx] | (buf[idx+1] << 8)) & 0x1FFF)
+            buf = xof.digest(N * 3 + 64)         # 12 bits per candidate, oversampled
+            poly, idx = [], 0
+            while len(poly) < N and idx + 1 < len(buf):
+                val = (buf[idx] | (buf[idx + 1] << 8)) & 0x0FFF
                 if val < Q:
                     poly.append(val)
-                idx += 3
-            # pad if needed
-            while len(poly) < N:
+                idx += 2
+            while len(poly) < N:                 # pragma: no cover - vanishingly rare
                 poly.append(0)
             row.append(poly[:N])
         A.append(row)
     return A
 
 
-def _poly_add(a: list[int], b: list[int]) -> list[int]:
-    return [_mod_q(x + y) for x, y in zip(a, b)]
-
-
-def _poly_mul_schoolbook(a: list[int], b: list[int]) -> list[int]:
-    """Schoolbook polynomial multiplication mod (X^N + 1, q)."""
-    result = [0] * N
-    for i in range(N):
-        for j in range(N):
-            idx = (i + j) % N
-            sign = -1 if (i + j) >= N else 1
-            result[idx] = _mod_q(result[idx] + sign * a[i] * b[j])
-    return result
-
-
-def _module_mul_add(A: list, s: list, e: list) -> list:
-    """Compute t = A·s + e  over R_q^k."""
-    t = [[0]*N for _ in range(K)]
-    for i in range(K):
-        for j in range(K):
-            prod = _poly_mul_schoolbook(A[i][j], s[j])
-            t[i] = _poly_add(t[i], prod)
-        t[i] = _poly_add(t[i], e[i])
-    return t
-
-
-# ── Key Generation ─────────────────────────────────────────────────────────────
+# -- Key material -------------------------------------------------------------
 
 class LWEKeyPair:
+    """Module-LWE keypair. Deterministic in `seed` - same seed, same key."""
+
     def __init__(self, seed: bytes = None):
         self.seed = seed or os.urandom(SEED_LEN)
         self._generate()
 
     def _generate(self):
-        # Public matrix A
         self.A = _gen_matrix_A(self.seed)
-
-        # Secret vector s (small coefficients)
         self.s = [_cbd(self.seed, nonce=i, length=N) for i in range(K)]
-
-        # Error vector e
-        self.e = [_cbd(self.seed, nonce=K+i, length=N) for i in range(K)]
-
-        # Public key: t = A·s + e
+        self.e = [_cbd(self.seed, nonce=K + i, length=N) for i in range(K)]
         self.t = _module_mul_add(self.A, self.s, self.e)
 
     def public_key_bytes(self) -> bytes:
-        """Serialize public key (seed + t) to bytes."""
+        """Public key = seed || t. Safe to publish; reveals nothing about s."""
         flat_t = [c for poly in self.t for c in poly]
-        packed = struct.pack(f"<{len(flat_t)}H", *flat_t)
-        return self.seed + packed
+        return self.seed + struct.pack("<%dH" % len(flat_t), *flat_t)
+
+    def public_key_b64(self) -> str:
+        return base64.b64encode(self.public_key_bytes()).decode()
+
+    def fingerprint(self) -> str:
+        """Short stable identifier for the public key - goes on every record."""
+        return hashlib.sha3_256(self.public_key_bytes()).hexdigest()[:16]
 
     def to_dict(self) -> dict:
         return {
             "seed_b64": base64.b64encode(self.seed).decode(),
-            "dimensions": f"{K}x{N}",
+            "dimensions": "%dx%d" % (K, N),
             "modulus_q": Q,
             "noise_eta": ETA,
+            "fingerprint": self.fingerprint(),
         }
 
 
-# ── Commitment ─────────────────────────────────────────────────────────────────
+class LWEPublicKey:
+    """Verifier-side view of a keypair: A and t only, never s.
+
+    Carries exactly what an external auditor needs to re-derive a commitment
+    from a disclosed opening, and nothing more.
+    """
+
+    def __init__(self, blob: bytes):
+        if len(blob) != SEED_LEN + K * N * 2:
+            raise ValueError("malformed public key: %d bytes" % len(blob))
+        self.seed = blob[:SEED_LEN]
+        flat = struct.unpack("<%dH" % (K * N), blob[SEED_LEN:])
+        self.t = [list(flat[i * N:(i + 1) * N]) for i in range(K)]
+        self.A = _gen_matrix_A(self.seed)
+
+    @classmethod
+    def from_b64(cls, b64: str) -> "LWEPublicKey":
+        return cls(base64.b64decode(b64))
+
+    def fingerprint(self) -> str:
+        flat_t = [c for poly in self.t for c in poly]
+        blob = self.seed + struct.pack("<%dH" % len(flat_t), *flat_t)
+        return hashlib.sha3_256(blob).hexdigest()[:16]
+
+
+# -- Message encoding ---------------------------------------------------------
+
+def encode_amount(amount_cents: int) -> list:
+    """Encode a 64-bit amount as one bit per coefficient, scaled by floor(q/2).
+
+    Distinct amounts differ in at least one coefficient by floor(q/2) = 1664,
+    three orders of magnitude beyond the reach of a CBD(eta=2) error term
+    (max |e| = 2). This is what makes the commitment binding across the full
+    64-bit domain.
+    """
+    if amount_cents < 0:
+        raise ValueError("amount_cents must be non-negative")
+    if amount_cents >= (1 << AMOUNT_BITS):
+        raise ValueError("amount_cents exceeds the %d-bit commitment domain" % AMOUNT_BITS)
+
+    m = [0] * N
+    half_q = Q // 2
+    for bit in range(AMOUNT_BITS):
+        if (amount_cents >> bit) & 1:
+            m[bit] = half_q
+    return m
+
+
+# -- Commitment ---------------------------------------------------------------
 
 def derive_randomness(master_key: bytes, txn_id: str) -> bytes:
-    """r = HMAC-SHA256(K_master, TXN_ID) — deterministic, no PII."""
+    """Blinding seed r = HMAC-SHA256(K_master, txn_id). Deterministic, no PII."""
     return hmac.new(master_key, txn_id.encode(), hashlib.sha256).digest()
 
 
-def commit(
-    keypair: LWEKeyPair,
-    amount_cents: int,
-    txn_id: str,
-    master_key: bytes,
-) -> dict:
-    """
-    Produce a ZK commitment to `amount_cents` using LWE.
-    Returns the commitment dict (no raw amount in output).
-
-    Commitment scheme:
-      r   = HMAC-SHA256(K_master, txn_id)
-      r'  = CBD(r, nonce=0..K)   [randomness vector]
-      e'  = CBD(r, nonce=K..2K)  [fresh error]
-      u   = A·r' + e'
-      v   = t·r' + e'' + encode(m)   where m = amount_cents
-      C   = (u, v)
-    """
-    r_seed = derive_randomness(master_key, txn_id)
-
-    # Randomness vector r'
+def _commit_core(A: list, t: list, amount_cents: int, r_seed: bytes) -> bytes:
+    """Shared commitment kernel, used by both the prover and the verifier."""
     r_vec = [_cbd(r_seed, nonce=i, length=N) for i in range(K)]
-    # Fresh error for u
-    e1 = [_cbd(r_seed, nonce=K+i, length=N) for i in range(K)]
-    # Fresh error for v
-    e2_raw = _cbd(r_seed, nonce=2*K, length=N)
+    e1 = [_cbd(r_seed, nonce=K + i, length=N) for i in range(K)]
+    e2 = _cbd(r_seed, nonce=2 * K, length=N)
 
-    # u = A^T · r' + e1
-    AT = [[keypair.A[j][i] for j in range(K)] for i in range(K)]
+    # u = A^T . r + e1
+    AT = [[A[j][i] for j in range(K)] for i in range(K)]
     u = _module_mul_add(AT, r_vec, e1)
 
-    # Encode message: m_poly[0] = round(q/2) * bit(amount), rest zeros
-    m_poly = [0] * N
-    # Encode amount as bit-packed into first few coefficients
-    amount_bits = min(amount_cents, (1 << N) - 1)
-    half_q = Q // 2
-    for bit_idx in range(min(32, N)):
-        if (amount_bits >> bit_idx) & 1:
-            m_poly[bit_idx] = half_q
+    # v = <t, r> + e2 + encode(m)
+    v = _inner_product(t, r_vec)
+    v = _poly_add(v, e2)
+    v = _poly_add(v, encode_amount(amount_cents))
 
-    # v = t · r' + e2 + m_poly  (simplified: use t[0] · r'[0])
-    v = _poly_mul_schoolbook(keypair.t[0], r_vec[0])
-    v = _poly_add(v, e2_raw)
-    v = _poly_add(v, m_poly)
+    flat = [c for poly in u for c in poly] + v
+    return struct.pack("<%dH" % len(flat), *flat)
 
-    # Serialize commitment
-    u_flat = [c for poly in u for c in poly]
-    v_flat = v
 
-    commitment_bytes = struct.pack(f"<{len(u_flat)}H", *u_flat)
-    commitment_bytes += struct.pack(f"<{len(v_flat)}H", *v_flat)
+def commit(keypair: LWEKeyPair, amount_cents: int, txn_id: str, master_key: bytes) -> dict:
+    """Produce a Module-LWE commitment to `amount_cents`.
 
-    commitment_b64 = base64.b64encode(commitment_bytes).decode()
-    size_kb = round(len(commitment_bytes) / 1024, 1)
-
-    # Binding hash (for fast lookup — NOT the secret)
-    binding = hashlib.sha3_256(commitment_bytes).hexdigest()
+    The returned dict carries no raw amount - only the commitment, its
+    binding hash, and public parameters.
+    """
+    r_seed = derive_randomness(master_key, txn_id)
+    blob = _commit_core(keypair.A, keypair.t, amount_cents, r_seed)
 
     return {
         "txn_id": txn_id,
-        "commitment_b64": commitment_b64,
-        "size_kb": size_kb,
-        "binding_hash": binding,
-        "lwe_params": {
-            "n": N, "k": K, "q": Q, "eta": ETA,
-        },
+        "commitment_b64": base64.b64encode(blob).decode(),
+        "size_kb": round(len(blob) / 1024, 2),
+        "binding_hash": hashlib.sha3_256(blob).hexdigest(),
+        "pubkey_fingerprint": keypair.fingerprint(),
+        "lwe_params": {"n": N, "k": K, "q": Q, "eta": ETA, "amount_bits": AMOUNT_BITS},
         "timestamp_ns": time.time_ns(),
         "pii_bytes": 0,
     }
 
 
-# ── Verification ───────────────────────────────────────────────────────────────
+def open_commitment(
+    public_key: LWEPublicKey,
+    commitment_b64: str,
+    amount_cents: int,
+    blinding_seed_hex: str,
+) -> bool:
+    """Verify a disclosed opening against a published commitment.
+
+    This is the selective-disclosure path: the bank reveals (amount, blinding)
+    for one transaction under audit, and the auditor - holding only the public
+    key - recomputes the commitment and compares. Every other transaction in
+    the ledger stays sealed.
+    """
+    try:
+        expected = base64.b64decode(commitment_b64)
+        recomputed = _commit_core(
+            public_key.A, public_key.t, amount_cents, bytes.fromhex(blinding_seed_hex)
+        )
+    except (ValueError, TypeError) as exc:
+        logger.warning("malformed opening: %s", exc)
+        return False
+    return hmac.compare_digest(expected, recomputed)
+
+
+# -- Verification trace (prover side, for the audit terminal) -----------------
 
 def verify(
     keypair: LWEKeyPair,
@@ -235,79 +358,121 @@ def verify(
     txn_id: str,
     master_key: bytes,
 ) -> dict:
-    """
-    Recompute commitment and compare bitwise against stored record.
-    Returns verification trace (for dashboard terminal display).
-    """
-    trace = []
-    trace.append({"step": "DERIVE_R", "detail": f"HMAC-SHA256(K_master, {txn_id})", "status": "RUNNING"})
+    """Recompute a commitment and compare it, emitting a step-by-step trace."""
+    trace = [{
+        "step": "DERIVE_BLINDING",
+        "detail": "r = HMAC-SHA256(K_master, %s)" % txn_id,
+        "status": "DONE",
+    }]
 
-    recomputed = commit(keypair, amount_cents, txn_id, master_key)
-
-    trace[0]["status"] = "DONE"
-    trace.append({"step": "LOAD_MATRIX_A", "detail": f"Public Matrix A ({K*N}×{K*N} mod q={Q})", "status": "DONE"})
-    trace.append({"step": "COMPUTE_AS_E", "detail": f"C = A·s + e (mod {Q})", "status": "DONE"})
-
-    stored_hash = commitment_record.get("binding_hash")
-    recomputed_hash = recomputed["binding_hash"]
-
-    match = hmac.compare_digest(stored_hash, recomputed_hash)
+    try:
+        recomputed = commit(keypair, amount_cents, txn_id, master_key)
+    except ValueError as exc:
+        trace.append({"step": "ENCODE_AMOUNT", "detail": str(exc), "status": "FAILED"})
+        return {"verified": False, "txn_id": txn_id, "trace": trace, "pii_bytes": 0}
 
     trace.append({
-        "step": "BITWISE_COMPARE",
-        "detail": f"stored={stored_hash[:16]}... recomputed={recomputed_hash[:16]}...",
-        "status": "DONE"
+        "step": "EXPAND_MATRIX_A",
+        "detail": "A in R_q^(%dx%d), deg %d, q=%d" % (K, K, N, Q),
+        "status": "DONE",
+    })
+    trace.append({
+        "step": "RECOMPUTE_COMMITMENT",
+        "detail": "u = A^T.r + e1 ; v = <t,r> + e2 + encode(m)  [%d-bit domain]" % AMOUNT_BITS,
+        "status": "DONE",
+    })
+
+    stored = commitment_record.get("binding_hash", "")
+    fresh = recomputed["binding_hash"]
+    match = bool(stored) and hmac.compare_digest(stored, fresh)
+
+    trace.append({
+        "step": "CONSTANT_TIME_COMPARE",
+        "detail": "stored=%s... recomputed=%s..." % (stored[:16], fresh[:16]),
+        "status": "DONE",
     })
     trace.append({
         "step": "RESULT",
-        "detail": "LWE PROOF INTACT — MATCH FOUND" if match else "PROOF MISMATCH — INTEGRITY VIOLATION",
-        "status": "VERIFIED" if match else "FAILED"
+        "detail": "LWE PROOF INTACT - BINDING VERIFIED" if match
+                  else "PROOF MISMATCH - INTEGRITY VIOLATION",
+        "status": "VERIFIED" if match else "FAILED",
     })
 
-    return {
-        "verified": match,
-        "txn_id": txn_id,
-        "trace": trace,
-        "pii_bytes": 0,
-    }
+    return {"verified": match, "txn_id": txn_id, "trace": trace, "pii_bytes": 0}
 
 
-# ── Singleton Key Store (in-memory for demo; use HSM in prod) ──────────────────
+# -- Process-wide key store ---------------------------------------------------
+#
+# Both the master key and the lattice seed are read from the environment so a
+# restarted prover reproduces the same keypair. Without them a fresh random key
+# is generated and every previously published commitment becomes unopenable -
+# tolerable for a scratch run, fatal for a ledger.
 
-_MASTER_KEY = os.environ.get("ZEROAUDIT_MASTER_KEY", "").encode() or os.urandom(32)
-_KEYPAIR: LWEKeyPair = None
+_KEYPAIR: Optional[LWEKeyPair] = None
+_MASTER_KEY: Optional[bytes] = None
+
+
+def _load_master_key() -> bytes:
+    raw = os.environ.get("ZEROAUDIT_MASTER_KEY", "").strip()
+    if raw:
+        if len(raw) == 64:
+            try:
+                return bytes.fromhex(raw)
+            except ValueError:
+                pass
+        return raw.encode()
+    logger.warning(
+        "ZEROAUDIT_MASTER_KEY unset - generating an ephemeral key. "
+        "Commitments will not survive a restart."
+    )
+    return os.urandom(32)
 
 
 def get_keypair() -> LWEKeyPair:
     global _KEYPAIR
     if _KEYPAIR is None:
-        seed_hex = os.environ.get("LWE_SEED_HEX", "")
-        seed = bytes.fromhex(seed_hex) if seed_hex else None
+        seed_hex = os.environ.get("LWE_SEED_HEX", "").strip()
+        seed = None
+        if seed_hex:
+            try:
+                seed = bytes.fromhex(seed_hex)[:SEED_LEN].ljust(SEED_LEN, b"\0")
+            except ValueError:
+                logger.error("LWE_SEED_HEX is not valid hex - using a random seed")
+        else:
+            logger.warning("LWE_SEED_HEX unset - generating an ephemeral lattice seed")
         _KEYPAIR = LWEKeyPair(seed)
+        logger.info("LWE keypair ready - fingerprint=%s", _KEYPAIR.fingerprint())
     return _KEYPAIR
 
 
 def get_master_key() -> bytes:
+    global _MASTER_KEY
+    if _MASTER_KEY is None:
+        _MASTER_KEY = _load_master_key()
     return _MASTER_KEY
 
 
 if __name__ == "__main__":
-    print("=== ZEROAUDIT LWE Self-Test ===")
+    logging.basicConfig(level=logging.INFO)
+    print("=== ZEROAUDIT Module-LWE Self-Test ===")
+    print("backend: %s" % ("numpy" if _NUMPY else "pure-python"))
+
     kp = get_keypair()
     mk = get_master_key()
+    print("params:  %s" % kp.to_dict())
 
-    print(f"Key params: {kp.to_dict()}")
+    t0 = time.perf_counter()
+    c = commit(kp, amount_cents=150_000, txn_id="TXN-TEST-0001", master_key=mk)
+    dt = time.perf_counter() - t0
+    print("commit:  %.2f ms  (%d commits/s single-core)" % (dt * 1000, 1 / dt))
+    print("size:    %s KB   binding=%s..." % (c["size_kb"], c["binding_hash"][:32]))
 
-    c = commit(kp, amount_cents=150000, txn_id="TXN-TEST-0001", master_key=mk)
-    print(f"Commitment size: {c['size_kb']} KB")
-    print(f"Binding hash:    {c['binding_hash'][:32]}...")
-    print(f"PII bytes:       {c['pii_bytes']}")
+    print("open(correct):     %s" % verify(kp, c, 150_000, "TXN-TEST-0001", mk)["verified"])
+    print("open(tampered):    %s" % verify(kp, c, 999_999, "TXN-TEST-0001", mk)["verified"])
+    print("open(+2^32):       %s" % verify(kp, c, 150_000 + (1 << 32), "TXN-TEST-0001", mk)["verified"])
+    print("open(+2^40):       %s" % verify(kp, c, 150_000 + (1 << 40), "TXN-TEST-0001", mk)["verified"])
 
-    result = verify(kp, c, amount_cents=150000, txn_id="TXN-TEST-0001", master_key=mk)
-    print(f"Verified: {result['verified']}")
-    for step in result['trace']:
-        print(f"  [{step['status']:8}] {step['step']}: {step['detail']}")
-
-    # Tamper test
-    bad = verify(kp, c, amount_cents=999999, txn_id="TXN-TEST-0001", master_key=mk)
-    print(f"Tamper detected: {not bad['verified']}")
+    pub = LWEPublicKey.from_b64(kp.public_key_b64())
+    r_hex = derive_randomness(mk, "TXN-TEST-0001").hex()
+    print("external open:     %s" % open_commitment(pub, c["commitment_b64"], 150_000, r_hex))
+    print("external tampered: %s" % open_commitment(pub, c["commitment_b64"], 150_001, r_hex))

@@ -1,11 +1,30 @@
-﻿"""
-prover/consumer.py – ZEROAUDIT Prover Kafka Consumer (with signature verification)
+"""
+prover/consumer.py - ZEROAUDIT prover ingest loop
+
+Consumes raw transactions, verifies their ingress signature, scores them with
+the intent engine, commits them under Module-LWE, and republishes a zero-PII
+envelope to the public topic.
+
+Ordering matters:
+
+    1. verify ingress signature   reject anything the bank did not sign
+    2. score with the intent engine  runs HERE, inside the prover, because
+                                     this is the last point at which the raw
+                                     amount legitimately exists
+    3. LWE commit + chain + sign
+    4. publish the zero-PII envelope
+
+Step 2 has to precede step 4 and cannot move to the verifier: the DMZ never
+sees an amount, so it could not compute these features. An earlier revision
+took `anomaly_score` straight off the inbound message, which meant the data
+producer was grading its own homework and the model never ran at all.
 """
 
 import json
 import time
 import logging
 import threading
+from collections import deque
 from typing import Optional
 
 from .config.settings import settings
@@ -16,31 +35,50 @@ logger = logging.getLogger("zeroaudit.prover.consumer")
 
 try:
     from kafka import KafkaConsumer, KafkaProducer
-    _KAFKA_AVAILABLE = True
+    _KAFKA = True
 except ImportError:
-    _KAFKA_AVAILABLE = False
-    logger.error("kafka-python not installed")
+    _KAFKA = False
+    logger.error("kafka-python not installed - prover cannot consume")
+
+try:
+    from verifier.anomaly_detector import get_detector
+    _DETECTOR = True
+except Exception as exc:  # pragma: no cover
+    _DETECTOR = False
+    logger.error("intent engine unavailable (%s) - transactions will not be scored", exc)
+
 
 class ProverConsumer:
+    """Kafka ingest loop for the prover enclave."""
+
     def __init__(self):
         self._running = False
-        self._consumer: Optional[object] = None
-        self._producer: Optional[object] = None
+        self._consumer = None
+        self._producer = None
         self._store = get_store()
+        self._detector = get_detector() if _DETECTOR else None
         self._lock = threading.Lock()
         self._stats = {
             "processed": 0,
             "errors": 0,
             "signature_failures": 0,
+            "quarantined": 0,
+            "publish_errors": 0,
             "start_time": time.time(),
         }
-        self._timestamps = []
+        self._timestamps: deque = deque(maxlen=5000)
+
+        if self._detector:
+            logger.info("intent engine backend: %s", self._detector.backend)
+
+    # -- connection -----------------------------------------------------------
 
     def _connect(self):
-        if not _KAFKA_AVAILABLE:
+        if not _KAFKA:
             raise RuntimeError("kafka-python not installed")
-        retries = 0
-        while retries < 10:
+
+        backoff = 2.0
+        for attempt in range(1, 13):
             try:
                 self._consumer = KafkaConsumer(
                     settings.KAFKA_TOPIC_INGEST,
@@ -49,94 +87,147 @@ class ProverConsumer:
                     value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                     auto_offset_reset="earliest",
                     enable_auto_commit=True,
+                    max_poll_records=settings.KAFKA_MAX_POLL_RECORDS,
                     consumer_timeout_ms=1000,
                 )
                 self._producer = KafkaProducer(
                     bootstrap_servers=settings.KAFKA_BOOTSTRAP,
                     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                    acks=1,
+                    linger_ms=10,
+                    retries=5,
                 )
-                logger.info(f"ProverConsumer connected to Kafka @ {settings.KAFKA_BOOTSTRAP}")
+                logger.info("prover connected to Kafka @ %s (group=%s)",
+                            settings.KAFKA_BOOTSTRAP, settings.KAFKA_CONSUMER_GROUP)
                 return
-            except Exception as e:
-                retries += 1
-                logger.warning(f"Kafka connect attempt {retries}/10 failed: {e}")
-                time.sleep(3)
-        raise RuntimeError("ProverConsumer could not connect to Kafka after 10 retries")
+            except Exception as exc:
+                logger.warning("Kafka connect attempt %d/12 failed: %s: %s",
+                               attempt, type(exc).__name__, exc)
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 30.0)
+
+        raise RuntimeError("prover could not reach Kafka after 12 attempts")
+
+    # -- processing -----------------------------------------------------------
 
     def _process(self, record: dict):
-        """Verify signature, then generate LWE commitment."""
+        txn_id = record.get("txn_id") or record.get("transaction_id", "unknown")
         try:
-            # 1. Signature verification (INGRESS FIREWALL)
+            # 1. Ingress firewall
             if not verify_transaction_signature(record):
-                logger.error(f"Signature verification FAILED for {record.get('txn_id')} – transaction DROPPED")
                 with self._lock:
                     self._stats["signature_failures"] += 1
-                return  # do not process further
+                logger.error("signature verification FAILED for %s - dropped", txn_id)
+                return
 
-            # 2. Extract fields
-            txn_id = record.get("txn_id") or record.get("transaction_id", "unknown")
-            amount_cents = int(record.get("amount_cents", record.get("amount", 0) * 100))
+            # 2. Extract. The amount exists only inside this boundary.
+            amount_cents = int(record.get("amount_cents",
+                                          float(record.get("amount", 0)) * 100))
             account_id = record.get("account_id", "unknown")
+            counterparty_id = record.get("counterparty_id", account_id)
             txn_type = record.get("txn_type", record.get("type", "UNKNOWN"))
-            anomaly_score = float(record.get("anomaly_score", 0.0))
+            timestamp_ns = int(record.get("timestamp_ns", time.time_ns()))
 
-            # 3. Generate LWE commitment (store handles crypto)
+            # 3. Score with the intent engine, in-enclave.
+            anomaly_score, flag_reason = 0.0, "NONE"
+            if self._detector:
+                import hashlib
+                verdict = self._detector.score(
+                    txn_id=txn_id,
+                    account_hash=hashlib.sha3_256(account_id.encode()).hexdigest(),
+                    counterparty_hash=hashlib.sha3_256(counterparty_id.encode()).hexdigest(),
+                    amount_cents=amount_cents,
+                    txn_type=txn_type,
+                    timestamp_ns=timestamp_ns,
+                )
+                anomaly_score = verdict["anomaly_score"]
+                flag_reason = verdict["flag_reason"]
+
+            # 4. Commit, chain, sign.
             committed = self._store.add(
                 txn_id=txn_id,
                 amount_cents=amount_cents,
                 account_id=account_id,
                 txn_type=txn_type,
                 anomaly_score=anomaly_score,
+                flag_reason=flag_reason,
+                threshold=settings.ANOMALY_THRESHOLD,
             )
 
-            # 4. Publish zero-PII commitment to public topic
-            public_record = committed.to_export_dict()
-            self._producer.send(settings.KAFKA_TOPIC_COMMITTED, value=public_record)
-
-            # 5. If anomaly, also publish to anomalies topic
+            # 5. Publish the zero-PII envelope.
+            envelope = committed.to_export_dict()
+            self._publish(settings.KAFKA_TOPIC_COMMITTED, envelope)
             if anomaly_score >= settings.ANOMALY_THRESHOLD:
-                self._producer.send(settings.KAFKA_TOPIC_ANOMALIES, value=public_record)
+                self._publish(settings.KAFKA_TOPIC_ANOMALIES, envelope)
+                with self._lock:
+                    self._stats["quarantined"] += 1
 
             with self._lock:
                 self._stats["processed"] += 1
                 self._timestamps.append(time.time())
-                cutoff = time.time() - 60
-                self._timestamps = [t for t in self._timestamps if t > cutoff]
 
-        except Exception as e:
+        except Exception as exc:
             with self._lock:
                 self._stats["errors"] += 1
-            logger.error(f"ProverConsumer process error on {record}: {e}")
+            logger.error("processing error on %s: %s: %s",
+                         txn_id, type(exc).__name__, exc, exc_info=True)
+
+    def _publish(self, topic: str, payload: dict):
+        try:
+            self._producer.send(topic, value=payload)
+        except Exception as exc:
+            with self._lock:
+                self._stats["publish_errors"] += 1
+            logger.error("publish to %s failed: %s", topic, exc)
+
+    # -- lifecycle ------------------------------------------------------------
 
     def run(self):
         self._running = True
         try:
             self._connect()
-        except RuntimeError as e:
-            logger.error(f"ProverConsumer failed to start: {e}")
+        except RuntimeError as exc:
+            logger.error("prover failed to start: %s", exc)
             return
-        logger.info("ProverConsumer run loop started")
+
+        logger.info("prover ingest loop started")
         while self._running:
             try:
-                records = self._consumer.poll(timeout_ms=500)
-                for tp, messages in records.items():
+                for _tp, messages in self._consumer.poll(timeout_ms=500).items():
                     for msg in messages:
                         self._process(msg.value)
-            except Exception as e:
-                self._stats["errors"] += 1
-                logger.error(f"ProverConsumer poll error: {e}")
+            except Exception as exc:
+                with self._lock:
+                    self._stats["errors"] += 1
+                logger.error("poll error: %s: %s", type(exc).__name__, exc)
                 time.sleep(1)
+
+        logger.info("prover ingest loop exiting")
 
     def stop(self):
         self._running = False
-        if self._consumer:
-            self._consumer.close()
-        if self._producer:
-            self._producer.close()
-        logger.info(f"ProverConsumer stopped. Stats: {self._stats}")
+        for handle in (self._consumer, self._producer):
+            try:
+                if handle:
+                    handle.close()
+            except Exception:
+                pass
+        logger.info("prover stopped. stats=%s", self.stats())
 
-    def tps(self) -> float:
+    # -- metrics --------------------------------------------------------------
+
+    def tps(self, window: int = 10) -> float:
+        """Throughput over a trailing window, in transactions per second."""
+        cutoff = time.time() - window
         with self._lock:
-            cutoff = time.time() - 30
-            recent = [t for t in self._timestamps if t > cutoff]
-        return round(len(recent) / 30, 1)
+            recent = sum(1 for t in self._timestamps if t > cutoff)
+        return round(recent / window, 2)
+
+    def stats(self) -> dict:
+        with self._lock:
+            snapshot = dict(self._stats)
+        snapshot["tps"] = self.tps()
+        snapshot["uptime_s"] = round(time.time() - snapshot.pop("start_time"), 1)
+        if self._detector:
+            snapshot["intent_engine"] = self._detector.stats()
+        return snapshot

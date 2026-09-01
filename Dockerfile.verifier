@@ -1,19 +1,28 @@
-﻿FROM python:3.10-slim
+# ZEROAUDIT Verifier - external DMZ.
+# Holds public keys only. Never receives an amount or a secret.
+FROM python:3.10-slim
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libffi-dev && \
+        gcc libffi-dev && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# prover/ is copied for its shared crypto primitives (signature verification,
+# chain-hash recomputation, LWE public-key handling). No key material ships in
+# the image; the verifier fetches PUBLIC keys from the prover at startup.
 COPY prover/ ./prover/
 COPY verifier/ ./verifier/
 
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 8001
+
+RUN useradd --create-home --uid 10002 verifier && chown -R verifier:verifier /app
+USER verifier
 
 CMD ["python", "-m", "verifier.dashboard"]

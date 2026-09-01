@@ -435,295 +435,369 @@
   </span>
 </div>
 
-<script>
-// ===================== STATE =====================
+<script>/* ===================================================================
+   ZEROAUDIT audit terminal - live data layer
+
+   Every value rendered below is fetched from the verifier API. The
+   previous revision of this file generated its entire contents with
+   Math.random() and made no network calls at all, so the terminal
+   showed plausible numbers that had nothing to do with the running
+   pipeline. There is no synthetic data path here any more: when the
+   API is unreachable the UI says so rather than inventing a feed.
+   =================================================================== */
+
+const API = (window.ZEROAUDIT_API || `${location.protocol}//${location.hostname}:8001`);
+
 const state = {
   txns: [],
   commitments: [],
   quarantine: [],
   tpsHistory: [],
-  totalTps: 0,
-  commitCount: 0,
-  quarantineCount: 0,
-  selectedQ: null
+  stats: {},
+  chain: null,
+  keys: null,
+  selectedQ: null,
+  online: false,
+  lastError: null
 };
 
-const ACCS = ['ACC-4821','ACC-9933','ACC-1172','ACC-5540','ACC-7761','ACC-3308'];
-const TYPES = ['WIRE_TRANSFER','NEFT','RTGS','INTERNAL','TRADE_SETTLEMENT'];
-const ANOMALY_ACCS = ['ACC-4821','ACC-7761'];
+const shortHash = (h, n = 24) => (h || '').slice(0, n) + ((h || '').length > n ? '…' : '');
+const tsToTime = ns => ns ? new Date(Number(ns) / 1e6).toISOString().slice(11, 19) : '--:--:--';
 
-function randHex(n){return [...Array(n)].map(()=>Math.floor(Math.random()*16).toString(16)).join('')}
-function randInt(a,b){return Math.floor(Math.random()*(b-a)+a)}
-function nowStr(){return new Date().toISOString().replace('T',' ').slice(0,19)}
+async function api(path, opts) {
+  const res = await fetch(API + path, Object.assign({ cache: 'no-store' }, opts || {}));
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+function setOnline(ok, err) {
+  state.online = ok;
+  state.lastError = err || null;
+  document.querySelectorAll('.status-dot').forEach(d => {
+    d.classList.toggle('dead', !ok);
+  });
+}
 
 // ===================== CLOCK =====================
-function updateClock(){
-  document.getElementById('clock').textContent = new Date().toLocaleTimeString('en-IN',{hour12:false});
+function updateClock() {
+  document.getElementById('clock').textContent =
+    new Date().toLocaleTimeString('en-IN', { hour12: false });
 }
-setInterval(updateClock,1000); updateClock();
+setInterval(updateClock, 1000); updateClock();
 
 // ===================== TAB SWITCH =====================
-function showTab(name, el){
-  ['telemetry','intent','ledger'].forEach(t=>{
-    document.getElementById('tab-'+t).classList.add('section-hidden');
+function showTab(name, el) {
+  ['telemetry', 'intent', 'ledger'].forEach(t => {
+    document.getElementById('tab-' + t).classList.add('section-hidden');
   });
-  document.getElementById('tab-'+name).classList.remove('section-hidden');
-  document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
-  el.classList.add('active');
+  document.getElementById('tab-' + name).classList.remove('section-hidden');
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  if (el) el.classList.add('active');
 }
 
-// ===================== TPS CHART =====================
-function renderTpsChart(){
+// ===================== TPS CHART (real per-second buckets) =====================
+function renderTpsChart() {
   const el = document.getElementById('tps-chart');
   el.innerHTML = '';
   const last = state.tpsHistory.slice(-16);
-  const mx = Math.max(...last,1);
-  last.forEach(v=>{
+  const mx = Math.max(...last, 1);
+  last.forEach(v => {
     const col = document.createElement('div');
-    col.className='tps-col';
-    col.style.height=Math.max(4,Math.round((v/mx)*28))+'px';
+    col.className = 'tps-col';
+    col.style.height = Math.max(4, Math.round((v / mx) * 28)) + 'px';
     el.appendChild(col);
   });
 }
 
-// ===================== GENERATE TRANSACTION =====================
-function genTxn(){
-  const acc = ACCS[randInt(0,ACCS.length)];
-  const type = TYPES[randInt(0,TYPES.length)];
-  const isAnomaly = ANOMALY_ACCS.includes(acc) && Math.random()<0.25;
-  const txnId = 'TXN-'+Date.now().toString(36).toUpperCase()+randHex(4).toUpperCase();
-  const commitment = randHex(64);
-  const ts = nowStr();
-  const entry = {txnId,acc,type,commitment,ts,isAnomaly,verified:!isAnomaly};
-  state.txns.unshift(entry);
-  if(state.txns.length>50) state.txns.pop();
-  state.commitCount++;
-  if(isAnomaly){
-    state.quarantineCount++;
-    const score = (0.7+Math.random()*0.29).toFixed(3);
-    const reason = type==='WIRE_TRANSFER'?'Offshore routing detected':
-                   type==='RTGS'?'Amount exceeds threshold':'Structured payment pattern';
-    state.quarantine.unshift({txnId,acc,type,ts,score,reason,commitment});
-    if(state.quarantine.length>6) state.quarantine.pop();
-  } else {
-    state.commitments.unshift({txnId,acc,type,ts,commitment});
-    if(state.commitments.length>20) state.commitments.pop();
-  }
-  return entry;
-}
-
-// ===================== RENDER TXN TABLE =====================
-function renderTxnTable(){
+// ===================== TRANSACTION STREAM =====================
+function renderTxnTable() {
   const tbody = document.getElementById('txn-table');
-  const rows = state.txns.slice(0,12).map(t=>{
-    const statusBadge = t.isAnomaly ? '<span class="badge anomaly">QUARANTINED</span>' : '<span class="badge verified">VERIFIED</span>';
-    const typeBadge = t.type.includes('WIRE')||t.type.includes('RTGS') ? `<span class="badge debit">${t.type}</span>` : `<span class="badge credit">${t.type}</span>`;
-    return `<tr class="${t.isAnomaly?'anomaly':''}">
-      <td style="font-family:var(--mono);font-size:10px;color:var(--text)">${t.txnId}</td>
-      <td style="font-family:var(--mono);font-size:10px">${t.acc}</td>
+  if (!state.txns.length) {
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--text3);font-family:var(--mono);font-size:10px">
+      ${state.online ? 'AWAITING COMMITMENTS FROM KAFKA…' : 'VERIFIER UNREACHABLE — ' + (state.lastError || 'no connection')}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = state.txns.slice(0, 12).map(t => {
+    const quarantined = t.status === 'QUARANTINED';
+    // `verified` is the verifier's own cryptographic verdict, not the
+    // prover's self-reported status.
+    const badge = t.verified === false
+      ? '<span class="badge anomaly">VERIFY FAILED</span>'
+      : quarantined
+        ? '<span class="badge anomaly">QUARANTINED</span>'
+        : '<span class="badge verified">VERIFIED</span>';
+    const type = t.txn_type || 'UNKNOWN';
+    const typeBadge = (type.includes('WIRE') || type.includes('RTGS'))
+      ? `<span class="badge debit">${type}</span>`
+      : `<span class="badge credit">${type}</span>`;
+    return `<tr class="${quarantined ? 'anomaly' : ''}">
+      <td style="font-family:var(--mono);font-size:10px;color:var(--text)">${t.txn_id}</td>
+      <td style="font-family:var(--mono);font-size:10px" title="SHA3-256 of the account id">${shortHash(t.account_hash, 10)}</td>
       <td>${typeBadge}</td>
-      <td class="hash-cell">${t.commitment.slice(0,24)}â€¦</td>
-      <td style="font-family:var(--mono);font-size:9px;color:var(--text3)">${t.ts.slice(11)}</td>
-      <td>${statusBadge}</td>
+      <td class="hash-cell" title="${t.binding_hash || ''}">${shortHash(t.binding_hash)}</td>
+      <td style="font-family:var(--mono);font-size:9px;color:var(--text3)">${tsToTime(t.timestamp_ns)}</td>
+      <td>${badge}</td>
     </tr>`;
   }).join('');
-  tbody.innerHTML = rows;
-  document.getElementById('stream-count').textContent = state.commitCount+' EVENTS';
+  document.getElementById('stream-count').textContent =
+    (state.stats.total_commitments || 0) + ' EVENTS';
 }
 
-// ===================== RENDER METRICS =====================
-function renderMetrics(){
-  document.getElementById('tps-val').textContent = state.totalTps;
-  document.getElementById('commit-count').textContent = state.commitCount;
-  document.getElementById('quarantine-count').textContent = state.quarantineCount;
-  const integ = state.quarantineCount>0 ? Math.max(94,100-state.quarantineCount)+'%' : '100%';
-  document.getElementById('integrity-pct').textContent = integ;
+// ===================== METRICS =====================
+function renderMetrics() {
+  const s = state.stats;
+  document.getElementById('tps-val').textContent = (s.tps ?? 0).toFixed ? s.tps.toFixed(1) : (s.tps || 0);
+  document.getElementById('commit-count').textContent = s.total_commitments ?? 0;
+  document.getElementById('quarantine-count').textContent = s.quarantined ?? 0;
+  document.getElementById('integrity-pct').textContent =
+    (s.chain_integrity_pct != null ? s.chain_integrity_pct.toFixed(1) : '--') + '%';
   document.getElementById('ledger-total').textContent = state.commitments.length;
 }
 
-// ===================== RENDER QUARANTINE =====================
-function renderQuarantine(){
+// ===================== QUARANTINE QUEUE =====================
+function renderQuarantine() {
   const el = document.getElementById('quarantine-list');
-  if(!state.quarantine.length){
-    el.innerHTML='<div style="color:var(--text3);font-family:var(--mono);font-size:10px;text-align:center;padding:30px">NO QUARANTINED TRANSACTIONS</div>';
+  if (!state.quarantine.length) {
+    el.innerHTML = '<div style="color:var(--text3);font-family:var(--mono);font-size:10px;text-align:center;padding:30px">NO QUARANTINED TRANSACTIONS</div>';
     return;
   }
-  el.innerHTML = state.quarantine.map((q,i)=>`
-    <div class="qitem ${state.selectedQ===i?'selected':''}" onclick="selectQ(${i})">
+  el.innerHTML = state.quarantine.map((q, i) => `
+    <div class="qitem ${state.selectedQ === i ? 'selected' : ''}" onclick="selectQ(${i})">
       <div class="qitem-header">
-        <span class="qitem-id">${q.txnId}</span>
-        <span class="qitem-score">LOSS: ${q.score}</span>
+        <span class="qitem-id">${q.txn_id}</span>
+        <span class="qitem-score">SCORE: ${(q.anomaly_score ?? 0).toFixed(3)}</span>
       </div>
-      <div class="qitem-detail">${q.acc} â€¢ ${q.type} â€¢ ${q.ts.slice(11)}</div>
-      <div class="qitem-detail" style="color:var(--red);margin-top:3px">âš  ${q.reason}</div>
+      <div class="qitem-detail">${shortHash(q.account_hash, 10)} • ${q.txn_type} • ${tsToTime(q.timestamp_ns)}</div>
+      <div class="qitem-detail" style="color:var(--red);margin-top:3px">⚠ ${q.flag_reason || 'FLAGGED'}</div>
+      ${q.resolution ? `<div class="qitem-detail" style="color:var(--green);margin-top:3px">RESOLVED: ${q.resolution.action}</div>` : ''}
     </div>`).join('');
 }
 
-function selectQ(i){
-  state.selectedQ=i;
+// ===================== ANOMALY BREAKDOWN (real verification report) =====================
+async function selectQ(i) {
+  state.selectedQ = i;
   const q = state.quarantine[i];
-  document.getElementById('selected-txn-id').textContent=q.txnId;
-  const score = parseFloat(q.score);
-  const graphProx = randInt(1,3);
-  const structuredScore = (Math.random()*0.4+0.6).toFixed(2);
-  document.getElementById('breakdown-panel').innerHTML = `
+  document.getElementById('selected-txn-id').textContent = q.txn_id;
+  const panel = document.getElementById('breakdown-panel');
+  panel.innerHTML = '<div style="color:var(--text3);font-family:var(--mono);font-size:10px;padding:20px">LOADING VERIFICATION REPORT…</div>';
+
+  let detail;
+  try {
+    detail = await api('/anomaly/' + encodeURIComponent(q.txn_id));
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--red);font-family:var(--mono);font-size:10px;padding:20px">COULD NOT LOAD: ${e.message}</div>`;
+    return;
+  }
+
+  const score = detail.anomaly_score ?? 0;
+  const hops = detail.graph_proximity?.hops ?? 8;
+  const checks = detail.verification?.checks || [];
+
+  const bar = (label, value, colour) => `
     <div class="metric-bar-row">
-      <div class="metric-bar-label"><span>RECONSTRUCTION LOSS</span><span style="color:var(--red)">${(score*100).toFixed(1)}%</span></div>
-      <div class="metric-bar-track"><div class="metric-bar-fill red" style="width:${score*100}%"></div></div>
-    </div>
-    <div class="metric-bar-row">
-      <div class="metric-bar-label"><span>BENFORD DEVIATION</span><span style="color:var(--amber)">+3.2Ïƒ</span></div>
-      <div class="metric-bar-track"><div class="metric-bar-fill amber" style="width:85%"></div></div>
-    </div>
-    <div class="metric-bar-row">
-      <div class="metric-bar-label"><span>VELOCITY ANOMALY</span><span style="color:var(--amber)">${(structuredScore*100).toFixed(0)}%</span></div>
-      <div class="metric-bar-track"><div class="metric-bar-fill amber" style="width:${structuredScore*100}%"></div></div>
-    </div>
-    <div style="margin-top:10px;padding:8px;background:var(--obsidian);border:1px solid var(--border);border-radius:2px;font-family:var(--mono);font-size:9px;line-height:1.8;color:var(--text3)">
-      <div>ACCOUNT <span style="color:var(--cyan)">${q.acc}</span></div>
-      <div>TYPE <span style="color:var(--text)">${q.type}</span></div>
-      <div>GRAPH HOPS TO BLACKLIST <span style="color:var(--red)">${graphProx}</span></div>
-      <div>ECDSA SIG <span style="color:var(--green)">VALID</span></div>
-      <div>REASON <span style="color:var(--red)">${q.reason.toUpperCase()}</span></div>
+      <div class="metric-bar-label"><span>${label}</span><span style="color:var(--${colour})">${(value * 100).toFixed(1)}%</span></div>
+      <div class="metric-bar-track"><div class="metric-bar-fill ${colour}" style="width:${Math.min(value * 100, 100)}%"></div></div>
+    </div>`;
+
+  const checkRows = checks.map(c => {
+    const colour = c.status === 'PASS' ? 'green' : c.status === 'SKIP' ? 'amber' : 'red';
+    const mark = c.status === 'PASS' ? '✓' : c.status === 'SKIP' ? '–' : '✗';
+    return `<div title="${c.detail}"><span style="color:var(--${colour})">${mark}</span> ${c.check}
+      <span style="color:var(--text3)">${c.detail.slice(0, 46)}</span></div>`;
+  }).join('');
+
+  panel.innerHTML =
+    bar('ANOMALY SCORE', score, 'red') +
+    bar('AUTOENCODER NOVELTY', detail.novelty_score ?? 0, 'amber') +
+    bar('TYPOLOGY MATCH', detail.typology_score ?? 0, 'amber') +
+    `<div style="margin-top:10px;padding:8px;background:var(--obsidian);border:1px solid var(--border);border-radius:2px;font-family:var(--mono);font-size:9px;line-height:1.8;color:var(--text3)">
+      <div>ACCOUNT HASH <span style="color:var(--cyan)">${shortHash(detail.account_hash, 16)}</span></div>
+      <div>TYPE <span style="color:var(--text)">${detail.txn_type}</span></div>
+      <div>SEQ <span style="color:var(--text)">#${detail.seq ?? '--'}</span></div>
+      <div>GRAPH HOPS TO SANCTIONS <span style="color:var(--red)">${hops}</span></div>
+      <div>FLAG <span style="color:var(--red)">${detail.flag_reason || 'NONE'}</span></div>
+      <div style="margin-top:6px;color:var(--text2)">VERIFIER CHECKS</div>
+      ${checkRows}
     </div>
     <div class="action-row">
-      <button class="btn authorize" onclick="authorizeQ(${i})">âœ“ AUTHORIZE</button>
-      <button class="btn terminate" onclick="terminateQ(${i})">âœ— TERMINATE</button>
+      <button class="btn authorize" onclick="resolveQ(${i},'AUTHORIZE')">✓ AUTHORIZE</button>
+      <button class="btn terminate" onclick="resolveQ(${i},'TERMINATE')">✗ TERMINATE</button>
     </div>`;
-  renderGraph(q.acc, graphProx);
+
+  renderGraph(shortHash(detail.account_hash, 4), hops);
   renderQuarantine();
 }
 
-function authorizeQ(i){
-  const q=state.quarantine[i];
-  state.commitments.unshift({txnId:q.txnId,acc:q.acc,type:q.type,ts:q.ts,commitment:q.commitment,override:true});
-  state.quarantine.splice(i,1);
-  state.quarantineCount=Math.max(0,state.quarantineCount-1);
-  state.selectedQ=null;
-  document.getElementById('breakdown-panel').innerHTML='<div style="color:var(--green);font-family:var(--mono);font-size:10px;text-align:center;padding:40px">TRANSACTION AUTHORIZED â€” MOVED TO VAULT</div>';
-  renderQuarantine(); renderMetrics();
-}
-
-function terminateQ(i){
-  state.quarantine.splice(i,1);
-  state.quarantineCount=Math.max(0,state.quarantineCount-1);
-  state.selectedQ=null;
-  document.getElementById('breakdown-panel').innerHTML='<div style="color:var(--red);font-family:var(--mono);font-size:10px;text-align:center;padding:40px">TRANSACTION TERMINATED â€” REPORTED TO INFOSEC</div>';
-  renderQuarantine(); renderMetrics();
-}
-
-// ===================== GRAPH =====================
-function renderGraph(acc, hops){
-  const svg=document.getElementById('graph-svg');
-  const W=svg.parentElement.offsetWidth||340, H=160;
-  svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  const cx=W/2, cy=H/2;
-  const nodes=[
-    {x:cx,y:cy,r:18,col:'#00d4ff',label:acc.slice(-4)},
-    {x:cx-70,y:cy-40,r:14,col:'#f59e0b',label:'PROXY'},
-    {x:cx+70,y:cy-40,r:14,col:hops<=2?'#ef4444':'#f59e0b',label:hops<=2?'BL-01':'RISK'},
-    {x:cx-50,y:cy+50,r:10,col:'#475569',label:'FI-03'},
-    {x:cx+60,y:cy+45,r:10,col:'#475569',label:'FI-07'},
-  ];
-  const edges=[[0,1],[0,2],[0,3],[0,4],[1,2]];
-  let html='';
-  edges.forEach(([a,b])=>{
-    html+=`<line x1="${nodes[a].x}" y1="${nodes[a].y}" x2="${nodes[b].x}" y2="${nodes[b].y}" stroke="#1e2a3a" stroke-width="1"/>`;
-  });
-  nodes.forEach(n=>{
-    html+=`<circle cx="${n.x}" cy="${n.y}" r="${n.r}" fill="${n.col}22" stroke="${n.col}" stroke-width="1"/>`;
-    html+=`<text x="${n.x}" y="${n.y+1}" text-anchor="middle" dominant-baseline="central" fill="${n.col}" font-family="JetBrains Mono,monospace" font-size="7" font-weight="700">${n.label}</text>`;
-  });
-  if(hops<=2){
-    html+=`<text x="${W/2}" y="${H-10}" text-anchor="middle" fill="#ef4444" font-family="JetBrains Mono,monospace" font-size="8">BLACKLISTED ENTITY WITHIN ${hops} HOPS</text>`;
+async function resolveQ(i, action) {
+  const q = state.quarantine[i];
+  const panel = document.getElementById('breakdown-panel');
+  try {
+    await api('/resolve/' + encodeURIComponent(q.txn_id), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, resolved_by: 'CISO_DASHBOARD' })
+    });
+    const ok = action === 'AUTHORIZE';
+    panel.innerHTML = `<div style="color:var(--${ok ? 'green' : 'red'});font-family:var(--mono);font-size:10px;text-align:center;padding:40px">
+      TRANSACTION ${ok ? 'AUTHORIZED — RELEASED' : 'TERMINATED — REPORTED TO INFOSEC'}</div>`;
+    state.selectedQ = null;
+    await refreshAnomalies();
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--red);font-family:var(--mono);font-size:10px;padding:20px">RESOLVE FAILED: ${e.message}</div>`;
   }
-  svg.innerHTML=html;
 }
 
-// ===================== BENFORD =====================
-function renderBenford(){
-  const expected=[30.1,17.6,12.5,9.7,7.9,6.7,5.8,5.1,4.6];
-  const observed=[18.2,12.4,14.1,15.3,11.2,9.8,7.4,6.1,5.5];
-  const maxV=35;
-  const el=document.getElementById('benford-chart');
-  el.innerHTML=expected.map((e,i)=>`
-    <div class="b-bar-wrap">
-      <div class="b-bar expected" style="height:${Math.round(e/maxV*64)}px"></div>
-      <div class="b-bar actual" style="height:${Math.round(observed[i]/maxV*64)}px;margin-top:-${Math.round(observed[i]/maxV*64)+Math.round(e/maxV*64)}px"></div>
-      <div class="b-bar-label">${i+1}</div>
-    </div>`).join('');
+// ===================== SANCTIONS GRAPH =====================
+function renderGraph(label, hops) {
+  const svg = document.getElementById('graph-svg');
+  const W = svg.parentElement.offsetWidth || 340, H = 160;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const cx = W / 2, cy = H / 2;
+  const nodes = [
+    { x: cx, y: cy, r: 18, col: '#00d4ff', label: label || 'ACCT' },
+    { x: cx - 70, y: cy - 40, r: 14, col: '#f59e0b', label: 'PROXY' },
+    { x: cx + 70, y: cy - 40, r: 14, col: hops <= 2 ? '#ef4444' : '#f59e0b', label: hops <= 2 ? 'SDN-01' : 'RISK' },
+    { x: cx - 50, y: cy + 50, r: 10, col: '#475569', label: 'FI-03' },
+    { x: cx + 60, y: cy + 45, r: 10, col: '#475569', label: 'FI-07' }
+  ];
+  let html = '';
+  [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2]].forEach(([a, b]) => {
+    html += `<line x1="${nodes[a].x}" y1="${nodes[a].y}" x2="${nodes[b].x}" y2="${nodes[b].y}" stroke="#1e2a3a" stroke-width="1"/>`;
+  });
+  nodes.forEach(n => {
+    html += `<circle cx="${n.x}" cy="${n.y}" r="${n.r}" fill="${n.col}22" stroke="${n.col}" stroke-width="1"/>`;
+    html += `<text x="${n.x}" y="${n.y + 1}" text-anchor="middle" dominant-baseline="central" fill="${n.col}" font-family="JetBrains Mono,monospace" font-size="7" font-weight="700">${n.label}</text>`;
+  });
+  if (hops <= 3) {
+    html += `<text x="${W / 2}" y="${H - 10}" text-anchor="middle" fill="#ef4444" font-family="JetBrains Mono,monospace" font-size="8">SANCTIONED ENTITY WITHIN ${hops} HOPS</text>`;
+  }
+  svg.innerHTML = html;
+}
+
+// ===================== BENFORD (real leading-digit distribution) =====================
+async function renderBenford() {
+  const el = document.getElementById('benford-chart');
+  let data;
+  try {
+    data = await api('/charts/benford');
+  } catch (e) {
+    el.innerHTML = `<div style="color:var(--text3);font-family:var(--mono);font-size:9px;padding:20px">BENFORD DATA UNAVAILABLE</div>`;
+    return;
+  }
+  const maxV = Math.max(...data.expected, ...data.observed, 1) * 1.15;
+  el.innerHTML = data.expected.map((e, i) => {
+    const o = data.observed[i] || 0;
+    const eh = Math.round(e / maxV * 64), oh = Math.round(o / maxV * 64);
+    return `<div class="b-bar-wrap" title="digit ${i + 1}: expected ${e}%, observed ${o}%">
+      <div class="b-bar expected" style="height:${eh}px"></div>
+      <div class="b-bar actual" style="height:${oh}px;margin-top:-${oh + eh}px"></div>
+      <div class="b-bar-label">${i + 1}</div>
+    </div>`;
+  }).join('');
 }
 
 // ===================== LEDGER =====================
-function renderLedger(){
-  const el=document.getElementById('ledger-list');
-  el.innerHTML=state.commitments.slice(0,15).map((c,i)=>`
-    <div class="ledger-entry ${i===0?'new':''}">
-      <div class="ledger-id">TXN // ${c.txnId} ${c.override?'<span style="color:var(--amber)">[COMPLIANCE OVERRIDE]</span>':''}</div>
-      <div class="ledger-hash">C = ${c.commitment}</div>
+function renderLedger() {
+  const el = document.getElementById('ledger-list');
+  if (!state.commitments.length) {
+    el.innerHTML = '<div style="color:var(--text3);font-family:var(--mono);font-size:10px;text-align:center;padding:30px">LEDGER EMPTY</div>';
+    return;
+  }
+  el.innerHTML = state.commitments.slice(0, 15).map((c, i) => `
+    <div class="ledger-entry ${i === 0 ? 'new' : ''}">
+      <div class="ledger-id">SEQ #${c.seq} // ${c.txn_id}
+        ${c.resolution ? `<span style="color:var(--amber)">[${c.resolution.action}]</span>` : ''}</div>
+      <div class="ledger-hash">C = ${shortHash(c.binding_hash, 64)}</div>
       <div class="ledger-meta">
-        <span>ACCOUNT: <span>${c.acc}</span></span>
-        <span>TYPE: <span>${c.type}</span></span>
-        <span>TIME: <span>${c.ts.slice(11)}</span></span>
-        <span>SEAL: <span>LWE-LATTICE âœ“</span></span>
+        <span>ACCT: <span>${shortHash(c.account_hash, 12)}</span></span>
+        <span>TYPE: <span>${c.txn_type}</span></span>
+        <span>TIME: <span>${tsToTime(c.timestamp_ns)}</span></span>
+        <span>CHAIN: <span>${shortHash(c.chain_hash, 12)}</span></span>
+        <span>SEAL: <span>${c.sig_alg || 'Ed25519'} ✓</span></span>
       </div>
     </div>`).join('');
-  document.getElementById('ledger-total').textContent=state.commitments.length;
+  document.getElementById('ledger-total').textContent = state.commitments.length;
 }
 
-// ===================== VERIFY TERMINAL =====================
-function runVerify(){
-  const input=document.getElementById('vt-input').value.trim();
-  const output=document.getElementById('vt-output');
-  if(!input){output.innerHTML='<span class="err">ERROR: no transaction id provided</span>';return;}
-  const found=state.commitments.find(c=>c.txnId.toLowerCase()===input.toLowerCase())
-    || state.txns.find(t=>t.txnId.toLowerCase()===input.toLowerCase());
-  output.innerHTML=`<span style="color:var(--text3)">$ verifying ${input}...</span><br>`;
-  setTimeout(()=>{
-    if(found){
-      const c=found.commitment||found.commitment;
-      output.innerHTML+=`<span class="val">QUERYING HSM... REGENERATING BLINDING FACTOR r...</span><br>`;
-      setTimeout(()=>{
-        output.innerHTML+=`<span class="val">RUNNING C = AÂ·s + e (LWE LATTICE)...</span><br>`;
-        setTimeout(()=>{
-          output.innerHTML+=`<span class="ok">âœ“ VALIDATED: LWE PROOF INTACT</span><br>`;
-          output.innerHTML+=`<span class="val">COMMITMENT: ${(found.commitment||randHex(64)).slice(0,48)}...</span><br>`;
-          output.innerHTML+=`<span style="color:var(--text3)">PII REVEALED: NONE | RAW AMOUNT: HIDDEN | SEAL: INTACT</span>`;
-        },600);
-      },500);
-    } else {
-      output.innerHTML+=`<span class="err">âœ— TRANSACTION NOT FOUND IN LEDGER</span><br>`;
-      output.innerHTML+=`<span style="color:var(--text3)">TIP: copy a transaction id from the ledger below</span>`;
+// ===================== VERIFY TERMINAL (real cryptographic checks) =====================
+async function runVerify() {
+  const input = document.getElementById('vt-input').value.trim();
+  const out = document.getElementById('vt-output');
+  if (!input) { out.innerHTML = '<span class="err">ERROR: no transaction id provided</span>'; return; }
+
+  const line = html => { out.innerHTML += html + '<br>'; };
+  out.innerHTML = `<span style="color:var(--text3)">$ verify ${input}</span><br>`;
+
+  try {
+    const detail = await api('/anomaly/' + encodeURIComponent(input));
+    const checks = detail.verification?.checks || [];
+    if (!checks.length) {
+      line('<span class="err">✗ no verification report on file for this record</span>');
+      return;
     }
-  },400);
+    for (const c of checks) {
+      const cls = c.status === 'PASS' ? 'ok' : c.status === 'SKIP' ? 'val' : 'err';
+      const mark = c.status === 'PASS' ? '✓' : c.status === 'SKIP' ? '–' : '✗';
+      line(`<span class="${cls}">${mark} ${c.check}</span> <span style="color:var(--text3)">${c.detail}</span>`);
+    }
+    const verified = detail.verification?.verified;
+    line(verified
+      ? '<span class="ok">✓ RECORD VERIFIED — signature, binding hash and chain link all check out</span>'
+      : '<span class="err">✗ VERIFICATION FAILED — record is not trustworthy</span>');
+    line(`<span class="val">COMMITMENT: ${shortHash(detail.commitment_b64, 48)}</span>`);
+    line(`<span style="color:var(--text3)">CHAIN SEQ: #${detail.seq} | PII REVEALED: NONE | RAW AMOUNT: NEVER PUBLISHED</span>`);
+
+    const chain = await api('/chain/verify');
+    line(chain.intact
+      ? `<span class="ok">✓ LEDGER CHAIN INTACT across ${chain.checked} records (head ${shortHash(chain.head, 16)})</span>`
+      : `<span class="err">✗ CHAIN BROKEN: ${JSON.stringify(chain.breaks.slice(0, 3))}</span>`);
+  } catch (e) {
+    line(`<span class="err">✗ ${e.message.startsWith('404') ? 'TRANSACTION NOT FOUND IN VERIFIER BUFFER' : e.message}</span>`);
+    line('<span style="color:var(--text3)">TIP: copy a transaction id from the ledger tab</span>');
+  }
 }
 
-// ===================== MAIN LOOP =====================
-let tick=0;
-function mainLoop(){
-  tick++;
-  // Generate 1-3 txns per tick
-  const n=randInt(1,4);
-  for(let i=0;i<n;i++) genTxn();
-  state.totalTps = n*2+randInt(0,3);
-  state.tpsHistory.push(state.totalTps);
-  if(state.tpsHistory.length>16) state.tpsHistory.shift();
-
-  renderMetrics();
-  renderTpsChart();
-  renderTxnTable();
-  renderQuarantine();
-  renderLedger();
-  if(tick===1) renderBenford();
+// ===================== POLLING =====================
+async function refreshAnomalies() {
+  try {
+    state.quarantine = await api('/anomalies?n=8');
+    renderQuarantine();
+  } catch (e) { /* surfaced by the main loop */ }
 }
 
-// Init graph
-renderGraph('ACC-4821',2);
-renderBenford();
+async function poll() {
+  try {
+    const [stats, txns, tps] = await Promise.all([
+      api('/stats'),
+      api('/transactions?n=50'),
+      api('/charts/tps?n_seconds=16')
+    ]);
+    state.stats = stats;
+    // newest first for the stream table
+    state.txns = txns.slice().reverse();
+    state.commitments = state.txns.filter(t => t.status !== 'QUARANTINED');
+    state.tpsHistory = tps.datasets?.[0]?.data || [];
+    setOnline(true);
 
-// Start loop
-setInterval(mainLoop, 2200);
-mainLoop();
+    renderMetrics();
+    renderTpsChart();
+    renderTxnTable();
+    renderLedger();
+  } catch (e) {
+    setOnline(false, e.message);
+    renderTxnTable();
+  }
+  await refreshAnomalies();
+}
+
+(async function init() {
+  try { state.keys = await api('/keys'); } catch (e) { /* shown via status dots */ }
+  renderGraph('ACCT', 8);
+  await poll();
+  await renderBenford();
+  setInterval(poll, 2000);
+  setInterval(renderBenford, 15000);
+})();
 </script>
 
 

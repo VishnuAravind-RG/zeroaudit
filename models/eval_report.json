@@ -1,0 +1,38 @@
+{
+  "backend": "onnx-fp16",
+  "roc_auc": 0.6914,
+  "detection_at_fpr": {
+    "fpr": 0.01,
+    "recall": 0.3955
+  },
+  "at_threshold_075": {
+    "recall": 0.3955,
+    "fpr": 0.0103
+  },
+  "by_typology": {
+    "structuring": {
+      "n": 107,
+      "recall": 1.0
+    },
+    "sanctions_adjacent": {
+      "n": 122,
+      "recall": 1.0
+    },
+    "benford_violation": {
+      "n": 121,
+      "recall": 0.0579
+    },
+    "velocity_burst": {
+      "n": 1536,
+      "recall": 0.3633
+    },
+    "offhours_settlement": {
+      "n": 124,
+      "recall": 0.0081
+    }
+  },
+  "attribution": {
+    "novelty": 886,
+    "typology": 1124
+  }
+}

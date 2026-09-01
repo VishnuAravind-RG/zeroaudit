@@ -1,8 +1,16 @@
-version: "3.9"
+# ZEROAUDIT - full stack
+#
+# Key material comes from .env (see .env.example). Generate a real one with:
+#     python -m scripts.gen_keys > .env
+#
+# Without those keys each container mints ephemeral ones at boot, which means
+# a restarted prover can no longer open any commitment it published earlier
+# and the verifier rejects every signature. Fine for a smoke test, useless
+# for a ledger.
 
 services:
 
-  # ── Apache Cassandra (LSM-Tree write absorber) ─────────────────────────────
+  # -- Apache Cassandra (append-only commitment ledger) ----------------------
   cassandra:
     image: cassandra:4.1
     container_name: zeroaudit-cassandra
@@ -11,18 +19,24 @@ services:
     environment:
       CASSANDRA_CLUSTER_NAME: zeroaudit-cluster
       CASSANDRA_DC: dc1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
       HEAP_NEWSIZE: 128M
       MAX_HEAP_SIZE: 512M
     volumes:
       - cassandra_data:/var/lib/cassandra
-      - ./services/cassandra/init.cql:/docker-entrypoint-initdb.d/init.cql
+    # NOTE: the schema is applied by the prover at startup, not by mounting a
+    # .cql file into /docker-entrypoint-initdb.d. That directory is a Postgres
+    # and MySQL convention; the Cassandra image does not execute anything in
+    # it, so the previous mount silently did nothing and the keyspace never
+    # existed.
     healthcheck:
-      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
-      interval: 30s
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' || exit 1"]
+      interval: 15s
       timeout: 10s
-      retries: 10
+      retries: 20
+      start_period: 60s
 
-  # ── Apache Zookeeper (Kafka dependency) ───────────────────────────────────
+  # -- Zookeeper ------------------------------------------------------------
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: zeroaudit-zookeeper
@@ -31,13 +45,19 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  # ── Apache Kafka ─────────────────────────────────────────────────────────
+  # -- Kafka ----------------------------------------------------------------
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: zeroaudit-kafka
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     ports:
       - "9092:9092"
       - "29092:29092"
@@ -48,15 +68,18 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_RETENTION_HOURS: 168
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-      interval: 20s
+      interval: 15s
       timeout: 10s
-      retries: 5
+      retries: 12
+      start_period: 30s
 
-  # ── Kafka Topic Init ──────────────────────────────────────────────────────
+  # -- Topic bootstrap ------------------------------------------------------
   kafka-init:
     image: confluentinc/cp-kafka:7.6.0
     container_name: zeroaudit-kafka-init
@@ -65,9 +88,10 @@ services:
         condition: service_healthy
     entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
     volumes:
-      - ./services/kafka/create_topics.sh:/scripts/create_topics.sh
+      - ./services/kafka/create_topics.sh:/scripts/create_topics.sh:ro
+    restart: "no"
 
-  # ── ZEROAUDIT Prover (SGX Enclave Prover) ────────────────────────────────
+  # -- Prover (enclave side: holds every secret, sees every amount) ---------
   prover:
     build:
       context: .
@@ -84,15 +108,26 @@ services:
       KAFKA_BOOTSTRAP: kafka:29092
       CASSANDRA_HOSTS: cassandra
       CASSANDRA_KEYSPACE: zeroaudit
+      CASSANDRA_ENABLED: "true"
+      ONNX_MODEL_PATH: /app/models/intent_autoencoder_fp16.onnx
+      ANOMALY_THRESHOLD: "0.75"
+      INGRESS_REQUIRE_SIGNATURE: "false"
       LOG_LEVEL: INFO
       API_HOST: 0.0.0.0
       API_PORT: "8000"
-      ANOMALY_THRESHOLD: "0.75"
-    env_file:
-      - .env
+      # Deterministic key material - see .env.example
+      ZEROAUDIT_MASTER_KEY: ${ZEROAUDIT_MASTER_KEY:-}
+      LWE_SEED_HEX: ${LWE_SEED_HEX:-}
+      SGX_SIGNING_KEY_B64: ${SGX_SIGNING_KEY_B64:-}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     restart: unless-stopped
 
-  # ── ZEROAUDIT Verifier (External DMZ) ────────────────────────────────────
+  # -- Verifier (external DMZ: public keys only, never an amount) -----------
   verifier:
     build:
       context: .
@@ -100,19 +135,28 @@ services:
     container_name: zeroaudit-verifier
     depends_on:
       kafka:
-        condition: service_healthy   # FIX: wait for Kafka to be ready, not just started
+        condition: service_healthy
       prover:
-        condition: service_started
-    environment:
-      KAFKA_BOOTSTRAP: kafka:29092
-      LOG_LEVEL: INFO
-    env_file:
-      - .env
-    restart: unless-stopped
+        condition: service_healthy
     ports:
       - "8001:8001"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      PROVER_URL: http://prover:8000
+      VERIFIER_PORT: "8001"
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:5173"
+      LOG_LEVEL: INFO
+      # Deliberately absent: no master key, no lattice seed, no signing key.
+      # The verifier fetches PUBLIC keys from the prover at startup.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
 
-  # ── Bank Simulator ────────────────────────────────────────────────────────
+  # -- Bank simulator -------------------------------------------------------
   simulator:
     build:
       context: .
@@ -123,18 +167,21 @@ services:
         condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
+      KAFKA_TOPIC_INGEST: zeroaudit.transactions.raw
       SIM_TPS: "15"
       SIM_ANOMALY_RATE: "0.05"
+      LOG_LEVEL: INFO
     restart: unless-stopped
 
-  # ── ZEROAUDIT Dashboard (Static HTML) ────────────────────────────────────
+  # -- Audit terminal -------------------------------------------------------
   dashboard:
     build: ./dashboard
     container_name: zeroaudit-dashboard
     ports:
       - "3000:80"
     depends_on:
-      - verifier
+      verifier:
+        condition: service_healthy
 
 volumes:
   cassandra_data:

@@ -1,12 +1,18 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
 .vscode/
+.idea/
 node_modules/
 dist/
-.next/
 cassandra_data/
 kafka_data/
 zookeeper_data/
-*.onnx
+
+# NOTE: models/*.onnx is deliberately NOT ignored.
+# The trained intent engine is a build artefact the runtime depends on -
+# ignoring it meant `docker compose up` started a prover with no model and
+# silently fell back to the statistical scorer. It is ~1 KB; it ships.

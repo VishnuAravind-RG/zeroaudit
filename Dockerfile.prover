@@ -1,20 +1,33 @@
-﻿FROM python:3.10-slim
+# ZEROAUDIT Prover - enclave side.
+# Holds the master key, lattice secret, and signing key. Sees raw amounts.
+FROM python:3.10-slim
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libffi-dev && \
+        gcc libffi-dev && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY prover/ ./prover/
+# The intent engine module is shared: it is DEFINED under verifier/ but
+# EXECUTES here, because scoring needs the raw amount and this is the last
+# point at which that legitimately exists.
 COPY verifier/ ./verifier/
 COPY simulator/ ./simulator/
+COPY ml/ ./ml/
+COPY models/ ./models/
 
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1 \
+    ONNX_MODEL_PATH=/app/models/intent_autoencoder_fp16.onnx
 
 EXPOSE 8000
+
+# Run as a non-root user: this container holds every secret in the system.
+RUN useradd --create-home --uid 10001 prover && chown -R prover:prover /app
+USER prover
 
 CMD ["python", "-m", "prover.main"]

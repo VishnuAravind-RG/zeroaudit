@@ -1,9 +1,10 @@
-﻿FROM python:3.10-slim
+# ZEROAUDIT bank transaction simulator.
+FROM python:3.10-slim
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc && \
+        gcc libffi-dev && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -12,6 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY simulator/ ./simulator/
 COPY prover/ ./prover/
 
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1
+
+RUN useradd --create-home --uid 10003 sim && chown -R sim:sim /app
+USER sim
 
 CMD ["python", "-m", "simulator.bank_sim"]

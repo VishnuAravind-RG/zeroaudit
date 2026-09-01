@@ -1,35 +1,41 @@
-# ZEROAUDIT — Python Dependencies
-# Install: pip install -r requirements.txt
+# ZEROAUDIT - Python dependencies
+#     pip install -r requirements.txt
+#
+# Pinned against Python 3.10, which is what the container images run.
+# Note: kafka-python 2.0.2 does not import on Python 3.12+ (it reaches into
+# kafka.vendor.six.moves, removed from the stdlib path in 3.12). Stay on 3.10
+# or switch to the maintained kafka-python-ng fork.
 
-# ── Web Framework ──────────────────────────────────────────────────────────────
+# -- Web framework ------------------------------------------------------------
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 pydantic==2.7.1
+httpx==0.27.0             # verifier fetches the prover's public keys over HTTP
 
-# ── Kafka ──────────────────────────────────────────────────────────────────────
+# -- Messaging ----------------------------------------------------------------
 kafka-python==2.0.2
 
-# ── Cassandra ─────────────────────────────────────────────────────────────────
+# -- Storage ------------------------------------------------------------------
 cassandra-driver==3.29.1
 
-# ── Cryptography ──────────────────────────────────────────────────────────────
-cryptography==42.0.7
+# -- Cryptography -------------------------------------------------------------
+cryptography==42.0.7      # Ed25519 attestation of published commitments
 
-# ── ML / Anomaly Detection ────────────────────────────────────────────────────
-onnxruntime==1.18.0
-numpy==1.26.4
-scikit-learn==1.5.0       # for training Isolation Forest → ONNX export
+# -- Intent engine ------------------------------------------------------------
+numpy==1.26.4             # ring arithmetic fast path + autoencoder training
+onnxruntime==1.18.0       # fp16 inference on the ingest path
+onnx==1.16.1              # graph construction, used only by ml/train_autoencoder
 
-# ── AWS (Parquet Vault) ───────────────────────────────────────────────────────
-boto3==1.34.110
-pyarrow==16.1.0
-
-# ── Dev / Testing ──────────────────────────────────────────────────────────────
+# -- Testing ------------------------------------------------------------------
 pytest==8.2.2
 pytest-asyncio==0.23.7
-httpx==0.27.0             # for FastAPI test client
+
+# -- Config -------------------------------------------------------------------
 python-dotenv==1.0.1
 
-# ── Logging / Observability ───────────────────────────────────────────────────
-structlog==24.2.0
-prometheus-client==0.20.0
+# Deliberately not included:
+#   scikit-learn  the autoencoder is trained with explicit NumPy gradients;
+#                 nothing in the codebase imports sklearn.
+#   boto3/pyarrow the S3 "parquet vault" they were pinned for does not exist.
+#   structlog     the project uses the stdlib logging module throughout.
+#   prometheus-client  no metrics endpoint is exposed; /stats serves JSON.

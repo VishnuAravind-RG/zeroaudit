@@ -1,19 +1,38 @@
-﻿"""
-verifier/__main__.py
-
-Entry point for: python -m verifier.dashboard
-Without this file, python -m verifier.dashboard runs dashboard.py but
-__name__ == 'verifier.dashboard' (not '__main__'), so the
-`if __name__ == '__main__': uvicorn.run(...)` block at the bottom of
-dashboard.py is never executed and uvicorn never starts.
 """
+verifier/__main__.py - entry point for `python -m verifier`
+
+The container runs `python -m verifier.dashboard`, which executes dashboard.py
+directly with __name__ == "__main__", so that module starts uvicorn itself and
+this file is not involved.
+
+(An earlier revision claimed the opposite - that without this file the
+`if __name__ == "__main__"` block in dashboard.py would never fire. That is
+backwards: `python -m pkg.module` does set __name__ to "__main__". This file
+only runs for `python -m verifier`.)
+
+It exists so both invocations work.
+"""
+
+import os
+import logging
+
 import uvicorn
+
 from prover.config.settings import settings
 
-uvicorn.run(
-    "verifier.dashboard:app",
-    host=getattr(settings, "API_HOST", "0.0.0.0"),
-    port=8001,
-    reload=False,
-    log_level=getattr(settings, "LOG_LEVEL", "info").lower(),
-)
+
+def main():
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format=settings.LOG_FORMAT,
+    )
+    uvicorn.run(
+        "verifier.dashboard:app",
+        host=settings.API_HOST,
+        port=int(os.environ.get("VERIFIER_PORT", "8001")),
+        reload=False,
+    )
+
+
+if __name__ == "__main__":
+    main()

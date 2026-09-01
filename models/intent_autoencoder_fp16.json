@@ -1,0 +1,63 @@
+{
+  "p50": 0.21434155106544495,
+  "p90": 0.6422362923622131,
+  "p95": 0.7928327322006226,
+  "p99": 1.3291230201721191,
+  "mean": 0.29358357191085815,
+  "std": 0.2693333327770233,
+  "feature_names": [
+    "log_amount",
+    "hour_of_day",
+    "day_of_week",
+    "txn_type_enc",
+    "benford_surprisal",
+    "velocity_1h",
+    "graph_hops",
+    "is_offhours",
+    "is_weekend",
+    "threshold_proximity"
+  ],
+  "layer_sizes": [
+    10,
+    6,
+    3,
+    6,
+    10
+  ],
+  "precision": "float16",
+  "standardized": true,
+  "feature_mean": [
+    0.447197,
+    0.55966,
+    0.621281,
+    0.29033,
+    0.645314,
+    0.078235,
+    0.765462,
+    0.032868,
+    0.495079,
+    0.000858
+  ],
+  "feature_std": [
+    0.125455,
+    0.173967,
+    0.381195,
+    0.306501,
+    0.207579,
+    0.036081,
+    0.169143,
+    0.178235,
+    0.499815,
+    0.023525
+  ],
+  "opset": 13,
+  "trained_utc": "2026-08-25T06:08:17Z",
+  "train_samples": 76000,
+  "holdout_samples": 19000,
+  "epochs": 250,
+  "seed": 1337,
+  "final_train_loss": 0.312035466183717,
+  "roc_auc": 0.7786,
+  "anomaly_mse_mean": 1.2955050468444824,
+  "fp16_median_rel_error": 0.00045904869330115616
+}
