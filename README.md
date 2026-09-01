@@ -279,6 +279,23 @@ The tamper suite asserts that edited, deleted, reordered, and re-signed records 
 
 ---
 
+## Design decisions worth defending
+
+The choices below were each a fork in the road with a real alternative. Stated so a reviewer doesn't have to reverse-engineer the reasoning from the diff.
+
+| Decision | Alternative considered | Why this one |
+|---|---|---|
+| Score = `max(novelty, typology)`, not a weighted sum | `0.5·novelty + 0.5·typology` | A confident rule (sanctions hop = 1) must never get diluted by a calm autoencoder, and vice versa. Averaging can let a 0.95 typology match and a 0.1 novelty score cancel into a 0.5 that misses the quarantine line. |
+| Autoencoder trained on normal traffic only | Supervised classifier on labelled fraud | Labelled fraud is scarce and backward-looking — it only teaches frauds someone already caught. An autoencoder flags anything structurally unlike normal traffic, so a novel pattern is anomalous by construction. |
+| 6→3→6 bottleneck, not wider | 16→8→16 | Measured directly: widening the bottleneck let the model reconstruct anomalies *too*, collapsing AUC from 0.78 to 0.43. A tighter bottleneck is a feature, not a compromise — it's what forces the network to only learn genuine regularities. |
+| Feature standardization baked into the ONNX graph | Standardize in Python before inference | Two code paths computing `mu`/`sigma` can drift out of sync after a retrain. Putting `Sub`/`Div` nodes in the graph itself makes that class of bug structurally impossible. |
+| Explicit NumPy forward/backward pass | PyTorch/TensorFlow | The network is ~350 parameters. A framework import costs hundreds of MB in the image for a model this size, and hand-written gradients keep the training run fully deterministic under a fixed seed — useful when a claimed AUC needs to be exactly reproducible. |
+| Cassandra partitioned by UTC day | One partition per account, or unbounded | An unbounded partition is the classic Cassandra failure mode — it grows forever and query latency degrades. Day-bucketing caps partition size at roughly one day of ingest regardless of ledger age. |
+| Verifier fetches prover's public key over HTTP at boot, trusts on first use | Bake the key into a config file at build time | Matches how the system is honestly described: this simulates enclave separation, not hardware attestation. Documented as a limitation rather than dressed up as something stronger (see Threat model below). |
+| 64-bit amount encoding (1 bit per lattice coefficient) | Encode a hash of the amount instead | Binding needs the recomputation to be exact and cheap for the auditor to check against a public key — hashing the amount would need the auditor to already know it to verify, defeating the purpose of a commitment. |
+
+---
+
 ## Threat model — what this does and does not defend against
 
 **Defended.** A dishonest prover cannot restate an amount after publication (binding), forge a record (Ed25519), or quietly rewrite history (hash chain). A compromised DMZ leaks nothing: it holds no amounts and no secrets. A compromised Kafka topic cannot inject records without the signing key.
