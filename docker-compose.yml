@@ -45,8 +45,15 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    # cp-zookeeper 7.6's default 4lw.commands.whitelist only enables `srvr` -
+    # `ruok` is disabled out of the box, and this image's configure script
+    # does not map ZOOKEEPER_4LW_COMMANDS_WHITELIST into zookeeper.properties
+    # at all (confirmed: the property never appears in the rendered config).
+    # `srvr` is always on and its "Mode: standalone" line is just as good a
+    # liveness signal, so the healthcheck uses that instead of fighting the
+    # whitelist.
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      test: ["CMD-SHELL", "echo srvr | nc -w 2 localhost 2181 | grep -q Mode"]
       interval: 10s
       timeout: 5s
       retries: 10

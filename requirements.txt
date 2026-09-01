@@ -14,6 +14,15 @@ httpx==0.27.0             # verifier fetches the prover's public keys over HTTP
 
 # -- Messaging ----------------------------------------------------------------
 kafka-python==2.0.2
+# services/kafka/create_topics.sh sets compression.type=lz4 on every topic it
+# creates, which forces the broker to store (and serve) all four topics as
+# LZ4-compressed batches. kafka-python has no built-in LZ4 support -- without
+# this package any consumer of those topics dies in a reconnect loop with
+# UnsupportedCodecError the moment it reads a compressed batch. Confirmed by
+# running the stack: the prover masked it (low enough throughput that early
+# batches stayed small and uncompressed) but the verifier hit it immediately
+# on catching up through the retained backlog.
+lz4==4.3.3
 
 # -- Storage ------------------------------------------------------------------
 cassandra-driver==3.29.1

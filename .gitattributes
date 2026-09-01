@@ -1,0 +1,8 @@
+# Shell scripts run inside Linux containers regardless of what platform
+# checked them out. Without this, Windows' core.autocrlf=true rewrites LF
+# to CRLF on checkout and every script breaks with `$'\r': command not found`
+# the moment it runs in a container -- confirmed the hard way against
+# services/kafka/create_topics.sh.
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.cql text eol=lf

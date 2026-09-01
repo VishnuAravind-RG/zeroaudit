@@ -16,3 +16,4 @@ zookeeper_data/
 # The trained intent engine is a build artefact the runtime depends on -
 # ignoring it meant `docker compose up` started a prover with no model and
 # silently fell back to the statistical scorer. It is ~1 KB; it ships.
+docker-compose.override.yml
