@@ -424,12 +424,11 @@ def sidebar_status():
     cs = _consumer.stats() if _consumer else {}
     v = _verifier.stats()
     return system_status(
-        cassandra_ok=True,
         kafka_ok=bool(cs.get("connected")),
         sgx_ok=_verifier.has_key,
         intent_engine_ok=v.get("records", 0) > 0,
+        chain_ok=chain_verify(500).get("intact", True),
         kafka_lag_ms=cs.get("lag_ms", 0.0),
-        cassandra_write_rate=round(cs.get("tps", 0.0) / 1000.0, 3),
     )
 
 
@@ -443,11 +442,16 @@ def sidebar_pipeline():
     cs = _consumer.stats() if _consumer else {}
     records = _committed(500)
     sizes = [r.get("size_kb", 0.0) for r in records if r.get("size_kb", 0.0) > 0]
+    vstats = _verifier.stats()
+    chain = chain_verify(500)
     return pipeline_nodes(
-        cassandra_write_rate=round(cs.get("tps", 0.0) / 1000.0, 3),
         kafka_lag_ms=cs.get("lag_ms", 0.0),
-        sgx_load_pct=min(100.0, cs.get("tps", 0.0) * 2),
+        kafka_connected=bool(cs.get("connected")),
+        has_prover_key=_verifier.has_key,
         lwe_payload_avg_kb=round(sum(sizes) / len(sizes), 2) if sizes else 0.0,
+        verified=vstats.get("verified", 0),
+        total=vstats.get("records", 0),
+        chain_intact=chain.get("intact", True),
     )
 
 

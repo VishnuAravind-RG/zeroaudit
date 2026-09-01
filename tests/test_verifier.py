@@ -342,14 +342,30 @@ class TestCharts:
 
 class TestSidebar:
     def test_system_status_all_online(self):
-        data = system_status(cassandra_ok=True, kafka_ok=True, sgx_ok=True,
-                             intent_engine_ok=True)
+        data = system_status(kafka_ok=True, sgx_ok=True,
+                             intent_engine_ok=True, chain_ok=True)
         assert all(c["status"] == "ONLINE" for c in data["components"])
 
     def test_system_status_degraded(self):
-        data = system_status(cassandra_ok=False, kafka_ok=True, sgx_ok=True,
-                             intent_engine_ok=True)
+        data = system_status(kafka_ok=False, sgx_ok=True,
+                             intent_engine_ok=True, chain_ok=True)
         assert any(c["status"] != "ONLINE" for c in data["components"])
+
+    def test_system_status_never_claims_cassandra_or_s3(self):
+        """
+        Regression: cassandra_lsm and s3_vault components used to be reported
+        unconditionally ONLINE, but the DMZ verifier has no connection to
+        either - Cassandra lives behind the enclave boundary, and no S3
+        vault exists anywhere in this codebase.
+        """
+        ids = {c["id"] for c in system_status()["components"]}
+        assert "cassandra_lsm" not in ids
+        assert "s3_vault" not in ids
+
+    def test_system_status_reflects_broken_chain(self):
+        data = system_status(chain_ok=False)
+        chain = next(c for c in data["components"] if c["id"] == "hash_chain")
+        assert chain["status"] == "FAULT"
 
     def test_alert_feed_from_real_anomalies(self):
         alerts = alert_feed(recent_anomalies=[{
@@ -363,6 +379,25 @@ class TestSidebar:
         assert alert_feed(recent_anomalies=[], n=5) == []
 
     def test_pipeline_nodes(self):
-        nodes = pipeline_nodes(cassandra_write_rate=1.0, kafka_lag_ms=5.0,
-                               sgx_load_pct=10.0, lwe_payload_avg_kb=1.5)
+        nodes = pipeline_nodes(kafka_lag_ms=5.0, kafka_connected=True,
+                               has_prover_key=True, lwe_payload_avg_kb=1.5,
+                               verified=10, total=10, chain_intact=True)
         assert len(nodes) >= 4
+
+    def test_pipeline_nodes_reports_only_dmz_observable_state(self):
+        """
+        Regression: this used to describe a Postgres/Debezium/S3 pipeline that
+        does not exist, and reported Kafka throughput mislabeled as a
+        Cassandra write rate. Every node here must be something the DMZ
+        verifier can actually observe about itself.
+        """
+        nodes = pipeline_nodes()
+        labels = " ".join(n["label"] for n in nodes)
+        assert "DEBEZIUM" not in labels
+        assert "PARQUET" not in labels
+        assert "CASSANDRA" not in labels
+
+    def test_pipeline_nodes_flags_broken_chain(self):
+        nodes = pipeline_nodes(chain_intact=False)
+        chain_node = next(n for n in nodes if n["id"] == "chain")
+        assert chain_node["status"] == "fault"

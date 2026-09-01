@@ -67,6 +67,9 @@ class ProverConsumer:
             "start_time": time.time(),
         }
         self._timestamps: deque = deque(maxlen=5000)
+        self._chain_topics = frozenset({
+            settings.KAFKA_TOPIC_COMMITTED, settings.KAFKA_TOPIC_ANOMALIES,
+        })
 
         if self._detector:
             logger.info("intent engine backend: %s", self._detector.backend)
@@ -130,6 +133,7 @@ class ProverConsumer:
 
             # 3. Score with the intent engine, in-enclave.
             anomaly_score, flag_reason = 0.0, "NONE"
+            novelty_score, typology_score = 0.0, 0.0
             if self._detector:
                 import hashlib
                 verdict = self._detector.score(
@@ -142,6 +146,11 @@ class ProverConsumer:
                 )
                 anomaly_score = verdict["anomaly_score"]
                 flag_reason = verdict["flag_reason"]
+                # Carried through to the export so the DMZ can show the
+                # autoencoder/typology split without re-running the detector
+                # on an amount it will never have.
+                novelty_score = verdict.get("novelty_score", 0.0)
+                typology_score = verdict.get("typology_score", 0.0)
 
             # 4. Commit, chain, sign.
             committed = self._store.add(
@@ -152,6 +161,8 @@ class ProverConsumer:
                 anomaly_score=anomaly_score,
                 flag_reason=flag_reason,
                 threshold=settings.ANOMALY_THRESHOLD,
+                novelty_score=novelty_score,
+                typology_score=typology_score,
             )
 
             # 5. Publish the zero-PII envelope.
@@ -174,7 +185,22 @@ class ProverConsumer:
 
     def _publish(self, topic: str, payload: dict):
         try:
-            self._producer.send(topic, value=payload)
+            # committed/anomalies carry a hash chain: record N's prev_chain_hash
+            # must equal record N-1's chain_hash. Kafka only guarantees order
+            # WITHIN a partition, and these topics have 6. Publishing with no
+            # key spreads records across all of them, so a single-consumer
+            # verifier polling all 6 partitions receives them interleaved
+            # rather than in production order - its online chain check then
+            # flags false breaks on nearly every record, even though the
+            # records are perfectly valid (confirmed: the offline
+            # /chain/verify, which sorts by seq before checking, sees no
+            # breaks in the same data). A constant key pins every record on a
+            # chain-linked topic to one partition, which costs nothing here
+            # because CommitmentStore.add() already serializes the chain
+            # under one lock - there was never real cross-partition
+            # parallelism to preserve.
+            key = b"zeroaudit-chain" if topic in self._chain_topics else None
+            self._producer.send(topic, key=key, value=payload)
         except Exception as exc:
             with self._lock:
                 self._stats["publish_errors"] += 1

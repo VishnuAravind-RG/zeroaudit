@@ -78,6 +78,8 @@ class CommitmentRecord:
     status: str = "PENDING"         # PENDING | VERIFIED | QUARANTINED | REJECTED
     anomaly_score: float = 0.0
     flag_reason: str = "NONE"
+    novelty_score: float = 0.0      # autoencoder component of anomaly_score
+    typology_score: float = 0.0     # rules-layer component of anomaly_score
 
     def to_export_dict(self) -> dict:
         """Zero-PII export. This is exactly what goes on the public Kafka topic.
@@ -106,6 +108,8 @@ class CommitmentRecord:
             "status": self.status,
             "anomaly_score": self.anomaly_score,
             "flag_reason": self.flag_reason,
+            "novelty_score": self.novelty_score,
+            "typology_score": self.typology_score,
         }
 
 
@@ -154,6 +158,8 @@ class CommitmentStore:
         anomaly_score: float = 0.0,
         flag_reason: str = "NONE",
         threshold: float = 0.75,
+        novelty_score: float = 0.0,
+        typology_score: float = 0.0,
     ) -> CommitmentRecord:
         """Commit one transaction: LWE commit -> chain -> sign -> persist."""
         account_hash = hashlib.sha3_256(account_id.encode()).hexdigest()
@@ -203,6 +209,8 @@ class CommitmentStore:
                 status=status,
                 anomaly_score=round(float(anomaly_score), 4),
                 flag_reason=flag_reason,
+                novelty_score=round(float(novelty_score), 4),
+                typology_score=round(float(typology_score), 4),
             )
 
             self._hot[txn_id] = record
@@ -253,6 +261,8 @@ class CommitmentStore:
             status=row.get("status") or "PENDING",
             anomaly_score=float(row.get("anomaly_score") or 0.0),
             flag_reason=row.get("flag_reason") or "NONE",
+            novelty_score=float(row.get("novelty_score") or 0.0),
+            typology_score=float(row.get("typology_score") or 0.0),
         )
 
     def audit_export(self, limit: int = 500) -> list:

@@ -238,3 +238,40 @@ class TestBatchAndStats:
             txn = generate_anomalous_transaction(atype)
             assert txn["ground_truth_type"] == atype
             assert txn["ground_truth_anomaly"] is True
+
+
+class TestChainTopicOrdering:
+    """
+    Regression: committed/anomalies were published with no partition key,
+    so Kafka's default partitioner spread a hash-linked stream across all 6
+    partitions. A single-consumer verifier polling all of them received
+    records interleaved rather than in production order, and its online
+    chain check flagged false breaks on nearly every record even though the
+    records themselves were valid. A constant key per chain-linked topic
+    keeps them on one partition, which is free here since the chain is
+    already fully serialized by CommitmentStore.add()'s lock.
+    """
+
+    def test_chain_linked_topics_get_a_partition_key(self, monkeypatch):
+        from prover.consumer import ProverConsumer
+        from prover.config.settings import settings
+
+        monkeypatch.setattr("prover.consumer._KAFKA", True)
+        consumer = ProverConsumer()
+        assert settings.KAFKA_TOPIC_COMMITTED in consumer._chain_topics
+        assert settings.KAFKA_TOPIC_ANOMALIES in consumer._chain_topics
+        assert settings.KAFKA_TOPIC_INGEST not in consumer._chain_topics
+
+        sent = []
+        consumer._producer = type("FakeProducer", (), {
+            "send": lambda self, topic, key=None, value=None: sent.append((topic, key)),
+        })()
+
+        consumer._publish(settings.KAFKA_TOPIC_COMMITTED, {"txn_id": "TXN-1"})
+        consumer._publish(settings.KAFKA_TOPIC_ANOMALIES, {"txn_id": "TXN-2"})
+
+        topic, key = sent[0]
+        assert key == b"zeroaudit-chain"
+        # Every chain-linked record uses the SAME key, so they all land on
+        # the same partition regardless of which of the two topics it is.
+        assert sent[0][1] == sent[1][1]

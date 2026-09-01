@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS %s.commitments_by_bucket (
     status             text,
     anomaly_score      double,
     flag_reason        text,
+    novelty_score      double,
+    typology_score     double,
     pii_bytes          int,
     PRIMARY KEY ((bucket), timestamp_ns, txn_id)
 ) WITH CLUSTERING ORDER BY (timestamp_ns DESC, txn_id ASC)
@@ -111,6 +113,8 @@ CREATE TABLE IF NOT EXISTS %s.commitments_by_txn (
     status             text,
     anomaly_score      double,
     flag_reason        text,
+    novelty_score      double,
+    typology_score     double,
     pii_bytes          int
 )
 """ % KEYSPACE
@@ -128,7 +132,8 @@ _COLUMNS = [
     "txn_id", "bucket", "timestamp_ns", "seq", "binding_hash", "chain_hash",
     "prev_chain_hash", "commitment_b64", "signature_b64", "signing_key_id",
     "pubkey_fingerprint", "size_kb", "lwe_params", "account_hash", "txn_type",
-    "status", "anomaly_score", "flag_reason", "pii_bytes",
+    "status", "anomaly_score", "flag_reason", "novelty_score", "typology_score",
+    "pii_bytes",
 ]
 
 
@@ -264,6 +269,8 @@ class CassandraLedger:
             "status": rec.get("status", ""),
             "anomaly_score": float(rec.get("anomaly_score", 0.0)),
             "flag_reason": rec.get("flag_reason", "NONE"),
+            "novelty_score": float(rec.get("novelty_score", 0.0)),
+            "typology_score": float(rec.get("typology_score", 0.0)),
             "pii_bytes": int(rec.get("pii_bytes", 0)),
         }
         return tuple(values[c] for c in _COLUMNS)

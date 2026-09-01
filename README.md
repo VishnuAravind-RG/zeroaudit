@@ -10,6 +10,24 @@ ZEROAUDIT replaces the data with proof. Transactions are committed under a Modul
 
 ---
 
+## Demo
+
+Screenshots of the public verifier terminal, taken against a live `docker compose up` run — every number on these pages is fetched from the verifier API, not hardcoded.
+
+**Pipeline telemetry** — live throughput, the enclave/DMZ boundary a transaction actually crosses, and per-node status pulled from `/sidebar/pipeline`.
+
+![Pipeline telemetry](assets/dashboard-telemetry.png)
+
+**Intent engine** — a live quarantine queue with the verifier's own five-check recomputation, the autoencoder/typology score split, the real sanctions-proximity graph for the selected transaction, and the Benford population test's χ² statistic.
+
+![Intent engine](assets/dashboard-intent.png)
+
+**Cryptographic ledger** — the committed ledger and a verification terminal that runs the same five checks against any transaction id you paste in.
+
+![Cryptographic ledger](assets/dashboard-ledger.png)
+
+---
+
 ## What it actually does
 
 ```

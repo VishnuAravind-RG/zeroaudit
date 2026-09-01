@@ -18,59 +18,56 @@ from typing import List, Dict, Any, Optional
 # ── System Status ─────────────────────────────────────────────────────────────
 
 def system_status(
-    cassandra_ok: bool = True,
     kafka_ok: bool = True,
     sgx_ok: bool = True,
     intent_engine_ok: bool = True,
+    chain_ok: bool = True,
     kafka_lag_ms: float = 0.0,
-    cassandra_write_rate: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Returns health status for all pipeline components.
-    All status flags must come from real health checks — no defaults that mask failures.
+    Returns health status for the components a DMZ observer can actually see.
+
+    Earlier versions of this function reported a Cassandra component that was
+    always hardcoded ONLINE (the verifier has no connection to Cassandra and
+    never did - that store lives on the prover side, on the other side of the
+    enclave boundary this whole system is built around), a "ZKP GEN" component
+    that was unconditionally ONLINE regardless of whether the chain actually
+    verified, and an S3/Parquet vault component describing infrastructure that
+    does not exist anywhere in this codebase. All three were fabricated.
+
+    What remains is exactly what the verifier can check without trusting
+    anyone: is Kafka connected, does it hold a prover public key, has the
+    intent engine actually scored anything, and does the hash chain it has
+    independently recomputed still verify.
     """
     components = [
-        {
-            "id": "cassandra_lsm",
-            "label": "CASSANDRA LSM",
-            "status": "ONLINE" if cassandra_ok else "DEGRADED",
-            "color": "#00e5ff" if cassandra_ok else "#ffd700",
-            "detail": f"{cassandra_write_rate:.1f}K writes/s" if cassandra_ok else "Elevated write latency",
-        },
         {
             "id": "kafka",
             "label": "KAFKA",
             "status": "ONLINE" if kafka_ok else "DEGRADED",
             "color": "#00e5ff" if kafka_ok else "#ffd700",
-            "detail": f"Lag {kafka_lag_ms:.0f}ms" if kafka_ok else "Lag elevated",
+            "detail": f"Lag {kafka_lag_ms:.0f}ms" if kafka_ok else "Disconnected",
         },
         {
             "id": "sgx_enclave",
             "label": "SGX ENCLAVE",
             "status": "ONLINE" if sgx_ok else "FAULT",
             "color": "#00ff88" if sgx_ok else "#ff0033",
-            "detail": "MEE ENC RAM active" if sgx_ok else "Enclave fault",
+            "detail": "Prover public key held" if sgx_ok else "No key exchanged yet",
         },
         {
             "id": "intent_engine",
             "label": "INTENT ENGINE",
             "status": "ONLINE" if intent_engine_ok else "DEGRADED",
             "color": "#ffd700" if intent_engine_ok else "#ff6b35",
-            "detail": "FP16 ONNX nominal" if intent_engine_ok else "Model inference slow",
+            "detail": "Scoring transactions" if intent_engine_ok else "No records scored yet",
         },
         {
-            "id": "zkp_gen",
-            "label": "ZKP GEN",
-            "status": "ONLINE",
-            "color": "#00e5ff",
-            "detail": "LWE commitment chain intact",
-        },
-        {
-            "id": "s3_vault",
-            "label": "PARQUET VAULT",
-            "status": "ONLINE",
-            "color": "#00e5ff",
-            "detail": "S3 write-ahead nominal",
+            "id": "hash_chain",
+            "label": "HASH CHAIN",
+            "status": "ONLINE" if chain_ok else "FAULT",
+            "color": "#00e5ff" if chain_ok else "#ff0033",
+            "detail": "Independently verified" if chain_ok else "BROKEN — see /chain/verify",
         },
     ]
 
@@ -134,76 +131,72 @@ def alert_feed(
 # ── Pipeline Node States ──────────────────────────────────────────────────────
 
 def pipeline_nodes(
-    cassandra_write_rate: float = 0.0,
     kafka_lag_ms: float = 0.0,
-    sgx_load_pct: float = 0.0,
+    kafka_connected: bool = False,
+    has_prover_key: bool = False,
     lwe_payload_avg_kb: float = 0.0,
+    verified: int = 0,
+    total: int = 0,
+    chain_intact: bool = True,
 ) -> List[Dict[str, Any]]:
     """
-    Returns pipeline topology node states for the animated pipeline diagram.
-    All load/rate metrics must come from real measurements passed in.
-    Zero fake random values — if a metric is 0.0 it displays as 0.0.
+    Returns pipeline topology node states for the diagram, restricted to what
+    a DMZ observer can legitimately measure.
 
-    Parameters:
-      cassandra_write_rate: real writes/sec from Cassandra metrics
-      kafka_lag_ms: real consumer lag from Kafka consumer metrics
-      sgx_load_pct: real enclave CPU load from /proc or SGX SDK metrics
-      lwe_payload_avg_kb: real average commitment size from CommitmentStore.stats()
+    This used to describe a Postgres -> Debezium CDC -> ... -> S3 Parquet
+    pipeline that does not exist in this system (there is no Postgres, no
+    Debezium, no S3 vault - the real path is Kafka -> prover -> Kafka), and
+    it reported a Cassandra write rate that was actually Kafka consumer
+    throughput divided by 1000. Both were fabricated.
+
+    The verifier is deliberately walled off from Cassandra and from the
+    prover's internals - that isolation is the point of the DMZ design, not
+    an oversight to paper over. So this reports only what the verifier
+    itself observes: the public Kafka topics it consumes, whether it holds
+    the prover's public key, and its own independent verification tally.
+    Enclave-internal stages (signing, LWE commitment, the hash chain) are
+    real, but happen behind a boundary this service cannot instrument -
+    the caller renders them as a static architecture diagram, not as a
+    live-metriced node, so the UI never implies visibility that isn't there.
     """
     return [
         {
-            "id": "db",
-            "short": "DB",
-            "label": "CASSANDRA\nLSM-TREE",
-            "sublabel": f"{cassandra_write_rate:.1f}K writes/s",
-            "status": "active",
-            "color": "#00e5ff",
-        },
-        {
-            "id": "cdc",
-            "short": "CDC",
-            "label": "DEBEZIUM\nCAPTURE",
-            "sublabel": "WAL streaming",
-            "status": "active",
-            "color": "#00e5ff",
-        },
-        {
-            "id": "mq",
+            "id": "kafka",
             "short": "MQ",
-            "label": "KAFKA\nINTERNAL",
-            "sublabel": f"lag {kafka_lag_ms:.0f}ms",
-            "status": "active" if kafka_lag_ms < 500 else "warning",
-            "color": "#00e5ff" if kafka_lag_ms < 500 else "#ffd700",
+            "label": "KAFKA\nCOMMITTED + ANOMALIES",
+            "sublabel": f"lag {kafka_lag_ms:.0f}ms" if kafka_connected else "disconnected",
+            "status": "active" if kafka_connected and kafka_lag_ms < 500 else "warning",
+            "color": "#00e5ff" if kafka_connected and kafka_lag_ms < 500 else "#ffd700",
         },
         {
-            "id": "sgx",
-            "short": "SGX",
-            "label": "SGX ENCLAVE\nPROVER",
-            "sublabel": f"MEE ENC RAM\n{sgx_load_pct:.1f}% load",
-            "status": "warning" if sgx_load_pct > 80 else "active",
-            "color": "#ffd700" if sgx_load_pct > 80 else "#ff6b35",
+            "id": "prover_key",
+            "short": "KEY",
+            "label": "PROVER\nPUBLIC KEY",
+            "sublabel": "fetched at boot" if has_prover_key else "unavailable",
+            "status": "active" if has_prover_key else "warning",
+            "color": "#00e5ff" if has_prover_key else "#ffd700",
         },
         {
-            "id": "zkp",
-            "short": "ZKP",
-            "label": "LWE\nCOMMIT GEN",
-            "sublabel": f"{lwe_payload_avg_kb:.1f}KB payloads" if lwe_payload_avg_kb > 0 else "awaiting data",
-            "status": "active",
-            "color": "#00e5ff",
+            "id": "verifier",
+            "short": "VER",
+            "label": "VERIFIER\n5 INDEPENDENT CHECKS",
+            "sublabel": f"{verified}/{total} verified" if total else "awaiting records",
+            "status": "active" if (total == 0 or verified == total) else "warning",
+            "color": "#00e5ff" if (total == 0 or verified == total) else "#ff6b35",
         },
         {
-            "id": "pub",
-            "short": "PUB",
-            "label": "PUBLIC\nKAFKA",
-            "sublabel": "DMZ export",
-            "status": "active",
-            "color": "#00e5ff",
+            "id": "chain",
+            "short": "CHAIN",
+            "label": "HASH CHAIN\nCONTINUITY",
+            "sublabel": "intact" if chain_intact else "BROKEN",
+            "status": "active" if chain_intact else "fault",
+            "color": "#00e5ff" if chain_intact else "#ff0033",
         },
         {
-            "id": "s3",
-            "short": "S3",
-            "label": "PARQUET\nVAULT",
-            "sublabel": "immutable",
+            "id": "commitments",
+            "short": "LWE",
+            "label": "COMMITMENT\nSIZE",
+            "sublabel": f"avg {lwe_payload_avg_kb:.1f}KB" if lwe_payload_avg_kb > 0 else "awaiting data",
             "status": "active",
             "color": "#00e5ff",
         },
