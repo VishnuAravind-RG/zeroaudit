@@ -246,39 +246,20 @@ class VelocityTracker:
 
 # -- Sanctions graph proximity -------------------------------------------------
 #
-# Deterministic prefix buckets stand in for a real graph traversal. In
-# production this becomes a Neo4j/TigerGraph query:
-#   MATCH p = (a {hash:$h})-[*1..5]->(b:Sanctioned) RETURN min(length(p))
-
-# Prefix width sets what fraction of the account universe is treated as
-# sanctioned, and it has to be realistic. Two-hex-char buckets marked ~6% of
-# all accounts as sanctions-adjacent, so the sanctions rule alone produced an
-# 8.7% false-positive rate on clean traffic - an alert queue nobody can staff.
-# The real OFAC SDN list is a vanishing fraction of global accounts, so these
-# use three hex characters: 1/4096 per bucket.
-_PREFIX_LEN = 3
-_OFAC_PREFIXES = frozenset(["000"])                                  # ~0.024%
-_RBI_FLAG_PREFIXES = frozenset(["001", "002"])                       # ~0.049%
-_FATF_PREFIXES = frozenset(["003", "004", "005", "006"])             # ~0.098%
-
+# Backed by a real Neo4j graph loaded with the actual U.S. Treasury OFAC SDN
+# list (see scripts/load_sanctions_graph.py and verifier/sanctions_graph.py).
+# graph_hops_to_blacklist() used to bucket accounts by hex-prefix as a stand-in
+# for a graph traversal; it now runs a real Cypher shortest-path query.
+#
+# A hard fallback to that old bucket logic is deliberately NOT wired in here:
+# if the graph is unreachable, SanctionsGraphClient returns a safe neutral
+# result (hops=8, "NONE") and marks itself degraded rather than silently
+# reintroducing the heuristic this replaces.
 
 def graph_hops_to_blacklist(account_hash: str, counterparty_hash: str):
-    """Return (hops, flag_reason). Deterministic in the input hashes."""
-    pa = account_hash[:_PREFIX_LEN].lower() if len(account_hash) >= _PREFIX_LEN else "fff"
-    pb = counterparty_hash[:_PREFIX_LEN].lower() if len(counterparty_hash) >= _PREFIX_LEN else "fff"
-
-    if pa in _OFAC_PREFIXES or pb in _OFAC_PREFIXES:
-        return 1, "OFAC_SANCTION_LIST"
-    if pa in _RBI_FLAG_PREFIXES or pb in _RBI_FLAG_PREFIXES:
-        return 2, "RBI_FLAG_2024"
-    if pa in _FATF_PREFIXES or pb in _FATF_PREFIXES:
-        return 3, "FATF_GREY_LIST"
-
-    try:
-        seed = int(account_hash[:2], 16)
-    except (ValueError, IndexError):
-        seed = 128
-    return 4 + (seed % 5), "NONE"
+    """Real graph-database lookup. See verifier/sanctions_graph.py."""
+    from .sanctions_graph import get_sanctions_graph
+    return get_sanctions_graph().hops_to_sanctioned(account_hash, counterparty_hash)
 
 
 # -- Feature extraction --------------------------------------------------------

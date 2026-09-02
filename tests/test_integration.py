@@ -97,7 +97,39 @@ class TestFullPipeline:
         assert store.verify_chain()["intact"] is True
         assert verifier.stats()["chain_broken"] == 0
 
-    def test_anomalies_reach_quarantine(self, pipeline):
+    def test_anomalies_reach_quarantine(self, pipeline, monkeypatch):
+        """
+        Sanctions proximity is a live Neo4j query in production
+        (scripts/load_sanctions_graph.py seeds the real graph); no Neo4j
+        runs in this test process, so the client's real degraded-mode
+        default (hops=8, "NONE") would make every sanctions_adjacent
+        transaction indistinguishable from clean traffic. This fake client
+        reproduces exactly what the seeded graph would report for the
+        simulator's deterministic demo account IDs, so the pipeline test
+        still exercises real quarantine logic end to end.
+        """
+        from simulator.bank_sim import (
+            SANCTIONED_ACCOUNTS, RBI_FLAGGED_ACCOUNTS, FATF_FLAGGED_ACCOUNTS,
+        )
+        tiers = {1: SANCTIONED_ACCOUNTS, 2: RBI_FLAGGED_ACCOUNTS, 3: FATF_FLAGGED_ACCOUNTS}
+        hash_to_hops = {
+            hashlib.sha3_256(acct.encode()).hexdigest(): (hops, flag)
+            for hops, accounts in tiers.items()
+            for acct in accounts
+            for flag in [{1: "OFAC_SANCTION_LIST", 2: "RBI_FLAG_2024",
+                          3: "FATF_GREY_LIST"}[hops]]
+        }
+
+        class SeededGraphFake:
+            def hops_to_sanctioned(self, account_hash, counterparty_hash=None):
+                for h in (account_hash, counterparty_hash):
+                    if h in hash_to_hops:
+                        return hash_to_hops[h]
+                return (8, "NONE")
+
+        monkeypatch.setattr("verifier.sanctions_graph.get_sanctions_graph",
+                           lambda: SeededGraphFake())
+
         store, _, _ = pipeline
         detector = AnomalyDetector()
         import random
@@ -108,7 +140,14 @@ class TestFullPipeline:
             envelope, _ = _ingest(store, detector, txn)
             if envelope["status"] == "QUARANTINED":
                 quarantined += 1
-        assert quarantined > 30
+        # Three severity tiers now, not one: OFAC (1 hop, typology 0.95) and
+        # RBI (2 hops, 0.85) clear the 0.75 quarantine line on the rule alone;
+        # FATF (3 hops, 0.70) sits just under it and only quarantines when the
+        # autoencoder's novelty score stacks on top - correctly, since a
+        # 3-hop grey-list proximity is genuinely less severe than a direct
+        # OFAC hit. With a uniform tier mix, roughly the OFAC+RBI two-thirds
+        # should reliably quarantine.
+        assert quarantined >= 24
 
     def test_scoring_is_not_supplied_by_the_producer(self):
         """

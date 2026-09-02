@@ -1,0 +1,17 @@
+# ZEROAUDIT sanctions graph loader - one-shot.
+# Loads the real OFAC SDN list (services/neo4j/sdn_snapshot.csv) into Neo4j
+# and seeds the demo account graph. See scripts/load_sanctions_graph.py.
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir neo4j==6.3.0
+
+COPY scripts/__init__.py ./scripts/__init__.py
+COPY scripts/load_sanctions_graph.py ./scripts/load_sanctions_graph.py
+COPY services/neo4j/sdn_snapshot.csv ./services/neo4j/sdn_snapshot.csv
+
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1
+
+CMD ["python", "-m", "scripts.load_sanctions_graph"]

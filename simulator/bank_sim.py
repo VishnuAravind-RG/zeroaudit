@@ -16,7 +16,8 @@ Every anomaly below now perturbs a field the feature extractor actually
 consumes:
 
   offhours_settlement  moves timestamp_ns into the 01:00-04:00 UTC window
-  sanctions_adjacent   picks an account whose SHA3-256 lands in an OFAC prefix
+  sanctions_adjacent   uses a demo account Neo4j has a real path from, to a
+                       real OFAC-listed entity (scripts/load_sanctions_graph.py)
   velocity_burst       emits a real burst from one account inside a few seconds
   structuring          amounts just under regulatory reporting thresholds
   benford_violation    leading digit 9, which Benford makes improbable
@@ -74,35 +75,20 @@ CURRENCIES = ["INR"] * 8 + ["USD", "EUR", "GBP", "JPY", "AED", "SGD"]
 
 ACCOUNT_POOL = ["ACC-%04d" % n for n in range(1000, 1200)]
 
-_PREFIX_LEN = 3
-_OFAC_PREFIXES = ("000",)
-_RBI_PREFIXES = ("001", "002")
-
-
 def _account_hash(account_id: str) -> str:
     return hashlib.sha3_256(account_id.encode()).hexdigest()
 
 
-def _find_flagged_accounts(prefixes, count: int, limit: int = 400_000) -> list:
-    """Search for account IDs whose hash lands in a sanctioned prefix bucket.
-
-    The verifier derives sanctions proximity from the account hash, so an
-    account is only genuinely 'adjacent' if its hash actually falls in the
-    bucket. Labelling it without moving the hash produces an unlearnable
-    example.
-    """
-    found = []
-    for n in range(limit):
-        acct = "ACC-SANC-%06d" % n
-        if _account_hash(acct)[:_PREFIX_LEN] in prefixes:
-            found.append(acct)
-            if len(found) >= count:
-                break
-    return found
-
-
-SANCTIONED_ACCOUNTS = _find_flagged_accounts(_OFAC_PREFIXES, 12)
-RBI_FLAGGED_ACCOUNTS = _find_flagged_accounts(_RBI_PREFIXES, 12)
+# Deterministic demo account IDs. scripts/load_sanctions_graph.py seeds these
+# exact same IDs into Neo4j with real graph edges to real OFAC-listed
+# entities at controlled hop distances (1/2/3), replacing the earlier
+# approach of searching for account IDs whose hash happened to fall in a
+# fixed hex-prefix bucket. Both sides now agree on "which accounts are
+# sanctions-adjacent" by referencing the same literal IDs, not by
+# recomputing a heuristic independently.
+SANCTIONED_ACCOUNTS = ["ACC-SANC-OFAC-%02d" % i for i in range(1, 5)]     # 1 hop
+RBI_FLAGGED_ACCOUNTS = ["ACC-SANC-RBI-%02d" % i for i in range(1, 5)]     # 2 hops
+FATF_FLAGGED_ACCOUNTS = ["ACC-SANC-FATF-%02d" % i for i in range(1, 5)]   # 3 hops
 
 
 def _log_normal_amount(low: int, high: int) -> int:
@@ -197,12 +183,16 @@ def generate_anomalous_transaction(anomaly_type: str = None) -> dict:
         txn["metadata"]["burst"] = True
 
     elif atype == "sanctions_adjacent":
-        # Move the HASH into an OFAC prefix bucket so proximity is real.
-        if SANCTIONED_ACCOUNTS:
-            if random.random() < 0.5:
-                txn["counterparty_id"] = random.choice(SANCTIONED_ACCOUNTS)
-            else:
-                txn["account_id"] = random.choice(SANCTIONED_ACCOUNTS)
+        # Use a demo account Neo4j has a real graph edge from, at a random
+        # tier - 1 hop (direct OFAC counterparty), 2 hops (one shell), or
+        # 3 hops (two shells) - so the intent engine's live Cypher query
+        # against the real sanctioned-entity graph has something genuine
+        # to find, rather than a hash landing in an arbitrary bucket.
+        pool = random.choice([SANCTIONED_ACCOUNTS, RBI_FLAGGED_ACCOUNTS, FATF_FLAGGED_ACCOUNTS])
+        if random.random() < 0.5:
+            txn["counterparty_id"] = random.choice(pool)
+        else:
+            txn["account_id"] = random.choice(pool)
         txn["amount_cents"] = _log_normal_amount(1_000_00, 50_000_000_00)
 
     elif atype == "benford_violation":

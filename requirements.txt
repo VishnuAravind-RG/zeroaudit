@@ -26,6 +26,9 @@ lz4==4.3.3
 
 # -- Storage ------------------------------------------------------------------
 cassandra-driver==3.29.1
+neo4j==6.3.0              # real graph queries against the actual OFAC SDN list -
+                           # see verifier/sanctions_graph.py and
+                           # scripts/load_sanctions_graph.py
 
 # -- Cryptography -------------------------------------------------------------
 cryptography==42.0.7      # Ed25519 attestation of published commitments

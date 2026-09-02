@@ -36,13 +36,14 @@ Screenshots of the public verifier terminal, taken against a live `docker compos
   simulator ──▶ Kafka ──▶ prover ─────────────────▶ Kafka ──▶ verifier ──▶ dashboard
    (signs)     raw      │                          committed │  (public       :3000
                         │ 1. verify ingress sig              │   keys only)
-                        │ 2. score  (FP16 ONNX autoencoder)  │
-                        │ 3. commit (Module-LWE)             │  ✓ Ed25519 signature
-                        │ 4. chain  (SHA3-256 links)         │  ✓ binding hash
-                        │ 5. sign   (Ed25519)                │  ✓ chain continuity
-                        ▼                                    │  ✓ LWE parameters
-                    Cassandra                                │  ✓ zero-PII assertion
-                  (durable ledger)                           │
+                        │ 2. score  (FP16 ONNX autoencoder   │
+                        │    + real Neo4j sanctions graph)   │  ✓ Ed25519 signature
+                        │ 3. commit (Module-LWE)             │  ✓ binding hash
+                        │ 4. chain  (SHA3-256 links)         │  ✓ chain continuity
+                        │ 5. sign   (Ed25519)                │  ✓ LWE parameters
+                        ▼                                    │  ✓ zero-PII assertion
+                Cassandra   Neo4j                             │
+              (durable ledger) (real OFAC SDN list)           │
                                                         │
         sees raw amounts                                │   never sees an amount
         holds every secret                              │   holds only public keys
@@ -56,6 +57,7 @@ The boundary is the design. The intent engine runs **inside** the prover because
 | Attestation | Ed25519 | Proves the enclave authored each record |
 | Tamper-evidence | SHA3-256 hash chain | Detects edit, insert, delete, reorder |
 | Intent engine | FP16 ONNX autoencoder + typology rules | Anomaly detection on metadata + amount |
+| Sanctions graph | Neo4j 5, loaded with the real OFAC SDN list | Cypher shortest-path proximity to a sanctioned entity |
 | Ledger | Apache Cassandra 4.1 | Append-only, day-partitioned, idempotent writes |
 | Transport | Apache Kafka 7.6 | Ordered, replayable, topic-isolated |
 | Verifier API | FastAPI | External DMZ, zero PII |
@@ -153,6 +155,27 @@ clean stream      : chi2 =     5.95   suspicious = False
 
 The 1.03% false-positive rate is the number that decides whether an alert queue is staffable.
 
+### Sanctions proximity is a real graph query
+
+`graph_hops_to_blacklist()` used to bucket accounts by the first few hex characters of their hash — a stand-in explicitly documented as "in production this becomes a Neo4j query." It now is one. `docker compose up` loads a **Neo4j** instance with the actual current [U.S. Treasury OFAC SDN list](https://sanctionslistservice.ofac.treas.gov/api/download/SDN.CSV) — ~19,300 real designated entities, refreshable with `python -m scripts.fetch_sanctions_list` — and the prover checks proximity with a real Cypher shortest-path query:
+
+```cypher
+MATCH (a:Account {hash: $hash})
+OPTIONAL MATCH p = shortestPath((a)-[:TRANSACTED_WITH*1..8]-(s:SanctionedEntity))
+RETURN length(p) AS hops, s.name, s.program
+```
+
+Verified against the live graph:
+
+```
+ACC-1050           -> no path (clean)
+ACC-1101           -> no path (clean)
+ACC-SANC-RBI-02    -> {hops: 2, name: 'URANIUM PROCESSING AND NUCLEAR FUEL COMPANY'}
+ACC-SANC-FATF-03   -> {hops: 3, name: 'SIERRA'}
+```
+
+**What's real and what isn't, precisely.** The ~19,300 sanctioned entities are the actual published OFAC list — real names, real program tags (`RUSSIA-EO14024`, `SDGT`, `IRAN-EO13902`). The query mechanism is a real graph database doing a real traversal, not a lookup table. What's still synthetic is *which demo accounts sit at which hop distance* from those entities (`scripts/load_sanctions_graph.py` seeds twelve fixed IDs — `ACC-SANC-OFAC-01` etc. — at 1/2/3 hops) — for the same reason the transaction stream itself is synthetic: no public dataset of real interbank relationships exists, for the same privacy reasons no public dataset of real bank transactions exists. The Neo4j client fails safe: if the graph is unreachable, it returns a neutral result and marks itself degraded rather than falling back to the hash-prefix heuristic it replaced.
+
 ---
 
 ## Getting started
@@ -170,7 +193,7 @@ python -m scripts.gen_keys > .env     # deterministic key material
 docker compose up --build -d
 ```
 
-Cassandra and Kafka take ~60s to report healthy; the other services wait on their health checks.
+Cassandra and Kafka take ~60s to report healthy. Neo4j comes up alongside them and a one-shot loader (`sanctions-init`) populates it with the real OFAC SDN list (~19,300 entities, a few seconds) before the prover is allowed to start — everything else waits on health checks.
 
 > **Why `.env` matters.** Without it every container mints ephemeral keys at boot, so a restarted prover can no longer open any commitment it published earlier and the verifier rejects every prior signature. Fine for a smoke test, useless for a ledger.
 
@@ -228,6 +251,7 @@ Training runs in ~16s on CPU. Forward/backward passes and Adam are written direc
 | Dashboard | 3000 | Static HTML, polls :8001 |
 | Kafka | 9092 | External listener |
 | Cassandra | 9042 | CQL |
+| Neo4j | 7687 (bolt), 7474 (browser) | Real OFAC sanctions graph — prover-only, not DMZ-reachable |
 
 **Prover:** `/health` `/stats` `/keys` `/chain/verify` `/audit/open` `/verify` `/ledger/export`
 **Verifier:** `/health` `/stats` `/keys` `/transactions` `/anomalies` `/anomaly/{id}` `/chain/verify` `/verify/opening` `/resolve/{id}` `/ledger/export` `/charts/*` `/sidebar/*` `/stream`
@@ -248,16 +272,21 @@ zeroaudit/
 ├── verifier/                   DMZ — public keys only
 │   ├── verify.py               Signature, binding, chain, params, PII checks
 │   ├── anomaly_detector.py     Intent engine (executes in the prover)
+│   ├── sanctions_graph.py      Real Neo4j Cypher client (executes in the prover)
 │   ├── kafka_client/consumer.py
 │   └── dashboard.py            Verifier API
 ├── ml/
 │   ├── train_autoencoder.py    NumPy training → FP16 ONNX export
 │   └── evaluate.py             Reproducible evaluation harness
 ├── models/                     Committed model artefact + calibration sidecar
+├── services/neo4j/sdn_snapshot.csv   Real U.S. Treasury OFAC SDN list snapshot
 ├── simulator/bank_sim.py       Signed synthetic traffic with real anomalies
 ├── dashboard/index.html        Audit terminal (live API)
-├── scripts/gen_keys.py
-└── tests/                      139 tests
+├── scripts/
+│   ├── gen_keys.py
+│   ├── fetch_sanctions_list.py    Refresh the real OFAC snapshot
+│   └── load_sanctions_graph.py    Load it into Neo4j + seed the demo graph
+└── tests/                      153 tests
 ```
 
 ---
@@ -311,6 +340,8 @@ The choices below were each a fork in the road with a real alternative. Stated s
 | Cassandra partitioned by UTC day | One partition per account, or unbounded | An unbounded partition is the classic Cassandra failure mode — it grows forever and query latency degrades. Day-bucketing caps partition size at roughly one day of ingest regardless of ledger age. |
 | Verifier fetches prover's public key over HTTP at boot, trusts on first use | Bake the key into a config file at build time | Matches how the system is honestly described: this simulates enclave separation, not hardware attestation. Documented as a limitation rather than dressed up as something stronger (see Threat model below). |
 | 64-bit amount encoding (1 bit per lattice coefficient) | Encode a hash of the amount instead | Binding needs the recomputation to be exact and cheap for the auditor to check against a public key — hashing the amount would need the auditor to already know it to verify, defeating the purpose of a commitment. |
+| Real Neo4j graph loaded with the actual OFAC SDN list | Keep the hash-prefix heuristic, or fabricate a synthetic sanctions list | The README already named this as the intended production path; leaving a documented stand-in in place indefinitely is worse than not documenting it. The government publishes the real list specifically for integration into screening systems like this one — there's no reason to fake data that's freely available. |
+| Sanctions client fails to a neutral result, not the old heuristic | Fall back to hash-prefix bucketing if Neo4j is unreachable | Falling back to the thing just replaced would silently reintroduce the exact simulation this was built to remove. A visible "degraded" status is honest; a silent heuristic fallback is not. |
 
 ---
 
@@ -320,8 +351,7 @@ The choices below were each a fork in the road with a real alternative. Stated s
 
 **Not defended.**
 
-- **SGX is simulated.** The prover is a normal container. The enclave boundary is enforced by process and network separation, not by hardware attestation. Running this under real SGX (or Gramine) would require a remote-attestation handshake before the verifier trusts the signing key. The current design is honest about where that key comes from: the verifier fetches it over HTTP at startup and trusts it on first use.
-- **Sanctions graph proximity is simulated.** Prefix buckets over the account hash stand in for a real graph traversal. In production this becomes a Neo4j/TigerGraph query; the interface is isolated in `graph_hops_to_blacklist()`.
+- **SGX is simulated.** The prover is a normal container — there is no SGX-capable hardware in this environment to run it on for real, and that's a physical constraint, not a design choice. The enclave boundary is enforced by process and network separation, not by hardware attestation. Running this under real SGX (or Gramine) would require a remote-attestation handshake before the verifier trusts the signing key. The current design is honest about where that key comes from: the verifier fetches it over HTTP at startup and trusts it on first use.
 - **Key custody.** Keys come from environment variables. Production would use an HSM or KMS.
 - **A prover that lies at ingest.** ZEROAUDIT proves the published ledger matches what the prover committed. It cannot prove the prover was shown every transaction — that requires attestation over the source system.
 
