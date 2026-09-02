@@ -94,6 +94,22 @@ def _record_verification(record: dict):
     return report
 
 
+def _prover_client_kwargs() -> dict:
+    """
+    httpx.Client kwargs for reaching the prover. If TLS_* env vars are set,
+    this presents the verifier's client certificate and verifies the
+    prover's certificate against the shared demo CA - real mutual TLS,
+    replacing a plain HTTP GET trusted on first use. Falls back to plain
+    HTTP if the certs aren't present, matching prover/main.py's own
+    fallback so both sides stay in the same mode together.
+    """
+    cert, key, ca = (os.environ.get(k) for k in
+                     ("TLS_VERIFIER_CERT_FILE", "TLS_VERIFIER_KEY_FILE", "TLS_CA_FILE"))
+    if cert and key and ca:
+        return {"cert": (cert, key), "verify": ca}
+    return {}
+
+
 def _fetch_prover_keys(retries: int = 30, delay: float = 3.0):
     """Retrieve the prover's public keys so signatures can be checked.
 
@@ -108,9 +124,14 @@ def _fetch_prover_keys(retries: int = 30, delay: float = 3.0):
         logger.error("httpx not installed - cannot fetch prover public keys")
         return
 
+    client_kwargs = _prover_client_kwargs()
+    if client_kwargs:
+        logger.info("fetching prover keys over mutual TLS")
+
     for attempt in range(1, retries + 1):
         try:
-            resp = httpx.get("%s/keys" % PROVER_URL, timeout=5.0)
+            with httpx.Client(timeout=5.0, **client_kwargs) as client:
+                resp = client.get("%s/keys" % PROVER_URL)
             resp.raise_for_status()
             _prover_keys = resp.json()
             _verifier.set_public_key(_prover_keys.get("ed25519_public_key_b64"))

@@ -174,8 +174,21 @@ services:
       ZEROAUDIT_MASTER_KEY: ${ZEROAUDIT_MASTER_KEY:-}
       LWE_SEED_HEX: ${LWE_SEED_HEX:-}
       SGX_SIGNING_KEY_B64: ${SGX_SIGNING_KEY_B64:-}
+      # Mutual TLS for the /keys exchange - see scripts/gen_tls_certs.py.
+      # Optional: unset (or an absent ./certs dir) falls back to plain HTTP,
+      # same as before.
+      TLS_CERT_FILE: /certs/prover.crt
+      TLS_KEY_FILE: /certs/prover.key
+      TLS_CA_FILE: /certs/ca.crt
+    volumes:
+      - ./certs:/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      # The whole listener requires a client certificate once TLS_CA_FILE is
+      # set, so the healthcheck must present one too. All demo certs are
+      # generated together into one local ./certs/ directory and bind-mounted
+      # read-only here - a real multi-host deployment would give this
+      # container only its own identity, not the verifier's.
+      test: ["CMD-SHELL", "python -c \"import ssl,urllib.request; ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations('/certs/ca.crt'); ctx.load_cert_chain('/certs/verifier.crt','/certs/verifier.key'); urllib.request.urlopen('https://localhost:8000/health', context=ctx, timeout=3)\""]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -214,12 +227,20 @@ services:
       - "8001:8001"
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
-      PROVER_URL: http://prover:8000
+      PROVER_URL: https://prover:8000
       VERIFIER_PORT: "8001"
       CORS_ORIGINS: "http://localhost:3000,http://localhost:5173"
       LOG_LEVEL: INFO
+      # Mutual TLS to reach the prover - see scripts/gen_tls_certs.py. The
+      # verifier presents this client cert; the prover checks it against
+      # the same CA before it will even complete the handshake.
+      TLS_VERIFIER_CERT_FILE: /certs/verifier.crt
+      TLS_VERIFIER_KEY_FILE: /certs/verifier.key
+      TLS_CA_FILE: /certs/ca.crt
       # Deliberately absent: no master key, no lattice seed, no signing key.
       # The verifier fetches PUBLIC keys from the prover at startup.
+    volumes:
+      - ./certs:/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8001/health')\""]
       interval: 15s

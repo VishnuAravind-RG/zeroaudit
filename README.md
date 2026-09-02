@@ -189,13 +189,16 @@ ACC-SANC-FATF-03   -> {hops: 3, name: 'SIERRA'}
 git clone https://github.com/VishnuAravind-RG/zeroaudit.git
 cd zeroaudit
 
-python -m scripts.gen_keys > .env     # deterministic key material
+python -m scripts.gen_keys > .env       # deterministic key material
+python -m scripts.gen_tls_certs         # local CA + prover/verifier mTLS certs
 docker compose up --build -d
 ```
 
 Cassandra and Kafka take ~60s to report healthy. Neo4j comes up alongside them and a one-shot loader (`sanctions-init`) populates it with the real OFAC SDN list (~19,300 entities, a few seconds) before the prover is allowed to start — everything else waits on health checks.
 
 > **Why `.env` matters.** Without it every container mints ephemeral keys at boot, so a restarted prover can no longer open any commitment it published earlier and the verifier rejects every prior signature. Fine for a smoke test, useless for a ledger.
+
+> **Why `certs/` matters.** `docker-compose.yml` points the prover and verifier at `/certs/*.pem` unconditionally, so this step isn't optional the way it might sound — skip it and the prover fails to start (it can't load a certificate that isn't there) rather than silently falling back to plain HTTP. Regenerate it the same way as `.env`: it's gitignored, and each environment gets its own.
 
 ### Verify it is working
 
@@ -246,7 +249,7 @@ Training runs in ~16s on CPU. Forward/backward passes and Adam are written direc
 
 | Service | Port | Notes |
 |---|---|---|
-| Prover | 8000 | **Enclave side.** Holds master key, lattice secret, signing key. Sees amounts. |
+| Prover | 8000 | **Enclave side.** Holds master key, lattice secret, signing key. Sees amounts. HTTPS with mutual TLS required — a plain `curl` here gets nothing back. |
 | Verifier | 8001 | **DMZ.** Public keys only. Never receives an amount. |
 | Dashboard | 3000 | Static HTML, polls :8001 |
 | Kafka | 9092 | External listener |
@@ -338,7 +341,7 @@ The choices below were each a fork in the road with a real alternative. Stated s
 | Feature standardization baked into the ONNX graph | Standardize in Python before inference | Two code paths computing `mu`/`sigma` can drift out of sync after a retrain. Putting `Sub`/`Div` nodes in the graph itself makes that class of bug structurally impossible. |
 | Explicit NumPy forward/backward pass | PyTorch/TensorFlow | The network is ~350 parameters. A framework import costs hundreds of MB in the image for a model this size, and hand-written gradients keep the training run fully deterministic under a fixed seed — useful when a claimed AUC needs to be exactly reproducible. |
 | Cassandra partitioned by UTC day | One partition per account, or unbounded | An unbounded partition is the classic Cassandra failure mode — it grows forever and query latency degrades. Day-bucketing caps partition size at roughly one day of ingest regardless of ledger age. |
-| Verifier fetches prover's public key over HTTP at boot, trusts on first use | Bake the key into a config file at build time | Matches how the system is honestly described: this simulates enclave separation, not hardware attestation. Documented as a limitation rather than dressed up as something stronger (see Threat model below). |
+| Prover↔verifier key exchange over real mutual TLS | Plain HTTP, trust on first use | A network position that could read or spoof a plaintext GET can do neither once both sides authenticate with X.509 certs from a shared CA. Real TLS mutual auth, not a simulation of SGX attestation — see Threat model below for exactly what that distinction does and doesn't buy. |
 | 64-bit amount encoding (1 bit per lattice coefficient) | Encode a hash of the amount instead | Binding needs the recomputation to be exact and cheap for the auditor to check against a public key — hashing the amount would need the auditor to already know it to verify, defeating the purpose of a commitment. |
 | Real Neo4j graph loaded with the actual OFAC SDN list | Keep the hash-prefix heuristic, or fabricate a synthetic sanctions list | The README already named this as the intended production path; leaving a documented stand-in in place indefinitely is worse than not documenting it. The government publishes the real list specifically for integration into screening systems like this one — there's no reason to fake data that's freely available. |
 | Sanctions client fails to a neutral result, not the old heuristic | Fall back to hash-prefix bucketing if Neo4j is unreachable | Falling back to the thing just replaced would silently reintroduce the exact simulation this was built to remove. A visible "degraded" status is honest; a silent heuristic fallback is not. |
@@ -351,7 +354,11 @@ The choices below were each a fork in the road with a real alternative. Stated s
 
 **Not defended.**
 
-- **SGX is simulated.** The prover is a normal container — there is no SGX-capable hardware in this environment to run it on for real, and that's a physical constraint, not a design choice. The enclave boundary is enforced by process and network separation, not by hardware attestation. Running this under real SGX (or Gramine) would require a remote-attestation handshake before the verifier trusts the signing key. The current design is honest about where that key comes from: the verifier fetches it over HTTP at startup and trusts it on first use. What's genuinely hardened, using real Linux/Docker primitives rather than defaults: the prover container runs `read_only: true` with `cap_drop: [ALL]` and `no-new-privileges` — a container holding the master key, lattice secret, and signing key has no writable filesystem and no Linux capability it doesn't strictly need, so a remote-code-execution bug in any dependency has nowhere to drop a payload and nothing to escalate with.
+- **SGX is simulated.** The prover is a normal container — there is no SGX-capable hardware in this environment to run it on for real, and that's a physical constraint, not a design choice. The enclave boundary is enforced by process and network separation and by two real (not simulated) hardening measures layered on top:
+  - **Mutual TLS**, replacing "the verifier fetches the prover's key over plain HTTP and trusts it on first use." `scripts/gen_tls_certs.py` generates a local CA and issues the prover a server certificate and the verifier a client certificate; the prover's `/keys` endpoint runs over HTTPS and refuses to complete the TLS handshake without a valid client certificate signed by that CA. Verified directly against the running containers: a plain HTTP request gets no response, an HTTPS request with no client certificate fails the handshake, and only a request presenting the verifier's certificate returns the key. This is real X.509 mutual authentication — it is **not** SGX remote attestation. It proves "this peer holds a private key our CA vouched for," not "this peer is an untampered enclave measured against a known-good hash," and that distinction matters: mTLS closes the plaintext-and-anyone-can-ask gap; it does not manufacture hardware attestation that doesn't exist here.
+  - **Container hardening**: the prover runs `read_only: true`, `cap_drop: [ALL]`, and `no-new-privileges` — genuine Linux/Docker primitives, not defaults. A container holding the master key, lattice secret, and signing key has no writable filesystem and no capability it doesn't strictly need, so a remote-code-execution bug in any dependency has nowhere to drop a payload and nothing to escalate with.
+
+  Running this under real SGX (or Gramine) would still add something neither of the above provides: hardware-measured proof of what code is actually executing, independent of whoever operates the host.
 - **Key custody.** Keys come from environment variables. Production would use an HSM or KMS.
 - **A prover that lies at ingest.** ZEROAUDIT proves the published ledger matches what the prover committed. It cannot prove the prover was shown every transaction — that requires attestation over the source system.
 

@@ -118,9 +118,44 @@ if __name__ == "__main__":
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         format=settings.LOG_FORMAT,
     )
+
+    # Mutual TLS, when certs are provided. This replaces "the verifier
+    # fetches /keys over plain HTTP and trusts it on first use" with a real
+    # TLS handshake in which the prover REQUIRES a client certificate signed
+    # by the same CA - a network position that could intercept or spoof the
+    # old plaintext exchange can no longer read it (TLS) or impersonate the
+    # verifier to obtain it (client cert required). Generate the demo CA and
+    # certs with `python -m scripts.gen_tls_certs`.
+    #
+    # Optional and off by default: with no cert env vars set, this serves
+    # plain HTTP exactly as before, which is what the local test suite and
+    # FastAPI's TestClient rely on (TestClient never touches the network
+    # stack, so TLS config here doesn't affect it either way).
+    tls_cert = os.environ.get("TLS_CERT_FILE")
+    tls_key = os.environ.get("TLS_KEY_FILE")
+    tls_ca = os.environ.get("TLS_CA_FILE")
+
+    ssl_kwargs = {}
+    if tls_cert and tls_key:
+        import ssl
+        ssl_kwargs = {
+            "ssl_certfile": tls_cert,
+            "ssl_keyfile": tls_key,
+        }
+        if tls_ca:
+            ssl_kwargs["ssl_ca_certs"] = tls_ca
+            ssl_kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+            logger.info("serving HTTPS with mutual TLS required (CA: %s)", tls_ca)
+        else:
+            logger.warning("TLS cert/key set but no CA - serving HTTPS without client auth")
+    else:
+        logger.warning("no TLS_CERT_FILE/TLS_KEY_FILE - serving plain HTTP "
+                       "(fine for local dev, not for anything holding these secrets)")
+
     uvicorn.run(
         app,
         host=settings.API_HOST,
         port=settings.API_PORT,
         log_level=settings.LOG_LEVEL.lower(),
+        **ssl_kwargs,
     )
