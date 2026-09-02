@@ -181,6 +181,23 @@ services:
       retries: 10
       start_period: 30s
     restart: unless-stopped
+    # Real SGX hardware isn't available to run this on, so the "enclave"
+    # boundary can't be hardware-attested - but the isolation AROUND it can
+    # still be genuinely enforced rather than left at Docker's defaults,
+    # which grant a broad Linux capability set and a writable root fs to a
+    # container holding the master key, the lattice secret, and the signing
+    # key. cap_drop removes every capability the prover doesn't use (it
+    # binds a single unprivileged port and makes outbound connections - it
+    # never needs raw sockets, ptrace, or anything else in the default set).
+    # read_only plus a tmpfs for /tmp means a remote code execution bug has
+    # nowhere on disk to drop a payload.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
   # -- Verifier (external DMZ: public keys only, never an amount) -----------
   verifier:

@@ -22,6 +22,7 @@ COPY models/ ./models/
 
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     ONNX_MODEL_PATH=/app/models/intent_autoencoder_fp16.onnx
 
 EXPOSE 8000
